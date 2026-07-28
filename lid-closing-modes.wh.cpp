@@ -1,0 +1,940 @@
+// ==WindhawkMod==
+// @id              lid-closing-modes
+// @name            Lid Closing Mode Button
+// @description     Adds a taskbar button that switches lid closing between sleep and do nothing
+// @version         1.0.0
+// @author          Roma
+// @include         explorer.exe
+// @architecture    x86-64
+// @license         MIT
+// @compilerOptions -DWIN32_LEAN_AND_MEAN -lole32 -loleaut32 -lruntimeobject -lwindowsapp -luser32 -lversion -lpowrprof
+// ==/WindhawkMod==
+
+// ==WindhawkModReadme==
+/*
+# Lid Closing Mode Button
+
+Adds a compact button immediately to the left of the Windows 11 system tray.
+The button switches the active power plan's **When I close the lid** action
+between:
+
+- Sleep
+- Do nothing
+
+Both the **On battery** and **Plugged in** values are changed together. The
+button reads the active power plan periodically, so changes made in Power
+Options or by another utility are reflected automatically.
+
+The moon icon means **Sleep**. The blocked icon means **Do nothing**. If the
+two power-source values differ, the button shows a question mark and the next
+click sets both values to **Sleep**.
+
+This mod targets the Windows 11 XAML taskbar.
+*/
+// ==/WindhawkModReadme==
+
+#undef GetCurrentTime
+
+#include <powrprof.h>
+#include <unknwn.h>
+#include <winver.h>
+
+#include <windhawk_utils.h>
+
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.UI.Xaml.h>
+#include <winrt/Windows.UI.Xaml.Automation.h>
+#include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
+#include <winrt/Windows.UI.Xaml.Controls.h>
+#include <winrt/Windows.UI.Xaml.Input.h>
+#include <winrt/Windows.UI.Xaml.Media.h>
+
+#include <atomic>
+#include <cwchar>
+#include <functional>
+#include <string>
+
+using namespace winrt::Windows::UI::Xaml;
+using namespace winrt::Windows::UI::Xaml::Automation;
+using namespace winrt::Windows::UI::Xaml::Controls;
+using namespace winrt::Windows::UI::Xaml::Media;
+
+namespace wuxi = winrt::Windows::UI::Xaml::Input;
+
+namespace {
+
+constexpr wchar_t kRootName[] = L"LidClosingModes_Root";
+constexpr DWORD kDoNothingValue = 0;
+constexpr DWORD kSleepValue = 1;
+constexpr DWORD kRefreshIntervalMs = 2000;
+
+// GUID_SYSTEM_BUTTON_SUBGROUP
+constexpr GUID kSystemButtonSubgroup = {
+    0x4f971e89,
+    0xeebd,
+    0x4455,
+    {0xa8, 0xde, 0x9e, 0x59, 0x04, 0x0e, 0x73, 0x47},
+};
+
+// GUID_LIDCLOSE_ACTION
+constexpr GUID kLidCloseAction = {
+    0x5ca83367,
+    0x6e45,
+    0x459f,
+    {0xa2, 0x7b, 0x47, 0x6b, 0x1d, 0x01, 0xc9, 0x36},
+};
+
+enum class LidMode {
+    DoNothing,
+    Sleep,
+    Mixed,
+    Unavailable,
+};
+
+struct LidSetting {
+    LidMode mode = LidMode::Unavailable;
+    DWORD acValue = 0;
+    DWORD dcValue = 0;
+    DWORD error = ERROR_SUCCESS;
+};
+
+std::atomic<bool> g_unloading{false};
+HWND g_taskbarWnd = nullptr;
+HANDLE g_monitorThread = nullptr;
+HANDLE g_monitorStopEvent = nullptr;
+
+Grid g_injectionRoot{nullptr};
+Grid g_injectionParent{nullptr};
+Button g_button{nullptr};
+FontIcon g_icon{nullptr};
+winrt::event_token g_clickToken{};
+winrt::event_token g_pointerEnteredToken{};
+
+DWORD g_lastOperationError = ERROR_SUCCESS;
+ULONGLONG g_lastOperationErrorExpiresAt = 0;
+
+using CTaskBand_GetTaskbarHost_t =
+    void*(WINAPI*)(void* pThis, void* taskbarHostSharedPtr);
+CTaskBand_GetTaskbarHost_t CTaskBand_GetTaskbarHost_Original = nullptr;
+
+using TaskbarHost_FrameHeight_t = int(WINAPI*)(void* pThis);
+TaskbarHost_FrameHeight_t TaskbarHost_FrameHeight_Original = nullptr;
+
+using std__Ref_count_base__Decref_t = void(WINAPI*)(void* pThis);
+std__Ref_count_base__Decref_t std__Ref_count_base__Decref_Original = nullptr;
+
+void* CTaskBand_ITaskListWndSite_vftable = nullptr;
+
+using RunFromWindowThreadProc = void (*)(void*);
+
+bool RunFromWindowThread(HWND hWnd,
+                         RunFromWindowThreadProc proc,
+                         void* procParam) {
+    static const UINT message =
+        RegisterWindowMessageW(L"Windhawk_RunFromWindowThread_" WH_MOD_ID);
+
+    struct InvokeParam {
+        RunFromWindowThreadProc proc;
+        void* procParam;
+    };
+
+    DWORD threadId = GetWindowThreadProcessId(hWnd, nullptr);
+    if (!threadId) {
+        return false;
+    }
+
+    if (threadId == GetCurrentThreadId()) {
+        proc(procParam);
+        return true;
+    }
+
+    HHOOK hook = SetWindowsHookExW(
+        WH_CALLWNDPROC,
+        [](int code, WPARAM wParam, LPARAM lParam) -> LRESULT {
+            if (code == HC_ACTION) {
+                const auto* messageData =
+                    reinterpret_cast<const CWPSTRUCT*>(lParam);
+                if (messageData->message ==
+                    RegisterWindowMessageW(
+                        L"Windhawk_RunFromWindowThread_" WH_MOD_ID)) {
+                    auto* invoke =
+                        reinterpret_cast<InvokeParam*>(messageData->lParam);
+                    invoke->proc(invoke->procParam);
+                }
+            }
+
+            return CallNextHookEx(nullptr, code, wParam, lParam);
+        },
+        nullptr,
+        threadId);
+    if (!hook) {
+        return false;
+    }
+
+    InvokeParam invoke{proc, procParam};
+    SendMessageW(hWnd, message, 0, reinterpret_cast<LPARAM>(&invoke));
+    UnhookWindowsHookEx(hook);
+    return true;
+}
+
+HWND FindCurrentProcessTaskbarWnd() {
+    HWND result = nullptr;
+    EnumWindows(
+        [](HWND hWnd, LPARAM lParam) -> BOOL {
+            DWORD processId = 0;
+            wchar_t className[64] = {};
+            if (GetWindowThreadProcessId(hWnd, &processId) &&
+                processId == GetCurrentProcessId() &&
+                GetClassNameW(hWnd, className, ARRAYSIZE(className)) &&
+                _wcsicmp(className, L"Shell_TrayWnd") == 0) {
+                *reinterpret_cast<HWND*>(lParam) = hWnd;
+                return FALSE;
+            }
+
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&result));
+    return result;
+}
+
+XamlRoot GetTaskbarXamlRoot(HWND hTaskbarWnd) {
+    if (!CTaskBand_GetTaskbarHost_Original ||
+        !TaskbarHost_FrameHeight_Original ||
+        !std__Ref_count_base__Decref_Original ||
+        !CTaskBand_ITaskListWndSite_vftable) {
+        return nullptr;
+    }
+
+    HWND hTaskSwWnd =
+        reinterpret_cast<HWND>(GetPropW(hTaskbarWnd, L"TaskbandHWND"));
+    if (!hTaskSwWnd) {
+        return nullptr;
+    }
+
+    void* taskBand =
+        reinterpret_cast<void*>(GetWindowLongPtrW(hTaskSwWnd, 0));
+    if (!taskBand) {
+        return nullptr;
+    }
+
+    void* taskBandForSite = taskBand;
+    for (int i = 0;
+         *reinterpret_cast<void**>(taskBandForSite) !=
+         CTaskBand_ITaskListWndSite_vftable;
+         i++) {
+        if (i == 20) {
+            return nullptr;
+        }
+        taskBandForSite =
+            reinterpret_cast<void**>(taskBandForSite) + 1;
+    }
+
+    void* taskbarHostSharedPtr[2] = {};
+    CTaskBand_GetTaskbarHost_Original(taskBandForSite,
+                                      taskbarHostSharedPtr);
+    if (!taskbarHostSharedPtr[0] || !taskbarHostSharedPtr[1]) {
+        if (taskbarHostSharedPtr[1]) {
+            std__Ref_count_base__Decref_Original(
+                taskbarHostSharedPtr[1]);
+        }
+        return nullptr;
+    }
+
+    size_t taskbarElementOffset = 0x10;
+    const BYTE* frameHeightCode =
+        reinterpret_cast<const BYTE*>(TaskbarHost_FrameHeight_Original);
+    if (frameHeightCode[0] == 0x48 && frameHeightCode[1] == 0x83 &&
+        frameHeightCode[2] == 0xEC && frameHeightCode[4] == 0x48 &&
+        frameHeightCode[5] == 0x83 && frameHeightCode[6] == 0xC1 &&
+        frameHeightCode[7] <= 0x7F) {
+        taskbarElementOffset = frameHeightCode[7];
+    } else {
+        Wh_Log(L"Unsupported TaskbarHost::FrameHeight prologue");
+    }
+
+    auto* taskbarElementUnknown = *reinterpret_cast<IUnknown**>(
+        reinterpret_cast<BYTE*>(taskbarHostSharedPtr[0]) +
+        taskbarElementOffset);
+    if (!taskbarElementUnknown) {
+        std__Ref_count_base__Decref_Original(taskbarHostSharedPtr[1]);
+        return nullptr;
+    }
+
+    FrameworkElement taskbarElement{nullptr};
+    taskbarElementUnknown->QueryInterface(
+        winrt::guid_of<FrameworkElement>(),
+        winrt::put_abi(taskbarElement));
+    XamlRoot result =
+        taskbarElement ? taskbarElement.XamlRoot() : nullptr;
+    std__Ref_count_base__Decref_Original(taskbarHostSharedPtr[1]);
+    return result;
+}
+
+FrameworkElement FindChildRecursive(
+    DependencyObject const& parent,
+    const std::function<bool(FrameworkElement const&)>& predicate,
+    int depth = 20) {
+    if (!parent || depth <= 0) {
+        return nullptr;
+    }
+
+    int childCount = VisualTreeHelper::GetChildrenCount(parent);
+    for (int i = 0; i < childCount; i++) {
+        auto child = VisualTreeHelper::GetChild(parent, i)
+                         .try_as<FrameworkElement>();
+        if (!child) {
+            continue;
+        }
+
+        if (predicate(child)) {
+            return child;
+        }
+
+        auto descendant =
+            FindChildRecursive(child, predicate, depth - 1);
+        if (descendant) {
+            return descendant;
+        }
+    }
+
+    return nullptr;
+}
+
+Grid FindSystemTrayGrid() {
+    if (!g_taskbarWnd) {
+        return nullptr;
+    }
+
+    auto xamlRoot = GetTaskbarXamlRoot(g_taskbarWnd);
+    if (!xamlRoot) {
+        return nullptr;
+    }
+
+    auto content = xamlRoot.Content().try_as<FrameworkElement>();
+    if (!content) {
+        return nullptr;
+    }
+
+    return FindChildRecursive(
+               content,
+               [](FrameworkElement const& element) {
+                   return element.Name() == L"SystemTrayFrameGrid";
+               })
+        .try_as<Grid>();
+}
+
+std::wstring FormatError(DWORD error) {
+    wchar_t* message = nullptr;
+    DWORD length = FormatMessageW(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+            FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,
+        error,
+        0,
+        reinterpret_cast<wchar_t*>(&message),
+        0,
+        nullptr);
+
+    std::wstring result;
+    if (length && message) {
+        result.assign(message, length);
+        while (!result.empty() &&
+               (result.back() == L'\r' || result.back() == L'\n' ||
+                result.back() == L' ')) {
+            result.pop_back();
+        }
+    } else {
+        wchar_t buffer[32];
+        swprintf_s(buffer, L"Win32 error %lu", error);
+        result = buffer;
+    }
+
+    if (message) {
+        LocalFree(message);
+    }
+    return result;
+}
+
+LidSetting ReadLidSetting() {
+    LidSetting result;
+    GUID* activeScheme = nullptr;
+    result.error = PowerGetActiveScheme(nullptr, &activeScheme);
+    if (result.error != ERROR_SUCCESS || !activeScheme) {
+        return result;
+    }
+
+    DWORD acError = PowerReadACValueIndex(
+        nullptr,
+        activeScheme,
+        &kSystemButtonSubgroup,
+        &kLidCloseAction,
+        &result.acValue);
+    DWORD dcError = PowerReadDCValueIndex(
+        nullptr,
+        activeScheme,
+        &kSystemButtonSubgroup,
+        &kLidCloseAction,
+        &result.dcValue);
+    LocalFree(activeScheme);
+
+    if (acError != ERROR_SUCCESS || dcError != ERROR_SUCCESS) {
+        result.error =
+            acError != ERROR_SUCCESS ? acError : dcError;
+        return result;
+    }
+
+    result.error = ERROR_SUCCESS;
+    if (result.acValue == kSleepValue &&
+        result.dcValue == kSleepValue) {
+        result.mode = LidMode::Sleep;
+    } else if (result.acValue == kDoNothingValue &&
+               result.dcValue == kDoNothingValue) {
+        result.mode = LidMode::DoNothing;
+    } else {
+        result.mode = LidMode::Mixed;
+    }
+
+    return result;
+}
+
+DWORD WriteLidMode(DWORD value) {
+    GUID* activeScheme = nullptr;
+    DWORD error = PowerGetActiveScheme(nullptr, &activeScheme);
+    if (error != ERROR_SUCCESS || !activeScheme) {
+        return error != ERROR_SUCCESS ? error : ERROR_INVALID_DATA;
+    }
+
+    DWORD oldAc = 0;
+    DWORD oldDc = 0;
+    error = PowerReadACValueIndex(nullptr,
+                                  activeScheme,
+                                  &kSystemButtonSubgroup,
+                                  &kLidCloseAction,
+                                  &oldAc);
+    if (error == ERROR_SUCCESS) {
+        error = PowerReadDCValueIndex(nullptr,
+                                      activeScheme,
+                                      &kSystemButtonSubgroup,
+                                      &kLidCloseAction,
+                                      &oldDc);
+    }
+    if (error != ERROR_SUCCESS) {
+        LocalFree(activeScheme);
+        return error;
+    }
+
+    error = PowerWriteACValueIndex(nullptr,
+                                   activeScheme,
+                                   &kSystemButtonSubgroup,
+                                   &kLidCloseAction,
+                                   value);
+    if (error != ERROR_SUCCESS) {
+        LocalFree(activeScheme);
+        return error;
+    }
+
+    error = PowerWriteDCValueIndex(nullptr,
+                                   activeScheme,
+                                   &kSystemButtonSubgroup,
+                                   &kLidCloseAction,
+                                   value);
+    if (error == ERROR_SUCCESS) {
+        error = PowerSetActiveScheme(nullptr, activeScheme);
+    }
+
+    if (error != ERROR_SUCCESS) {
+        PowerWriteACValueIndex(nullptr,
+                               activeScheme,
+                               &kSystemButtonSubgroup,
+                               &kLidCloseAction,
+                               oldAc);
+        PowerWriteDCValueIndex(nullptr,
+                               activeScheme,
+                               &kSystemButtonSubgroup,
+                               &kLidCloseAction,
+                               oldDc);
+        PowerSetActiveScheme(nullptr, activeScheme);
+    }
+
+    LocalFree(activeScheme);
+    return error;
+}
+
+std::wstring PowerValueName(DWORD value) {
+    switch (value) {
+        case 0:
+            return L"\u043d\u0438\u0447\u0435\u0433\u043e "
+                   L"\u043d\u0435 \u0434\u0435\u043b\u0430\u0442\u044c";
+        case 1:
+            return L"\u0441\u043e\u043d";
+        case 2:
+            return L"\u0433\u0438\u0431\u0435\u0440\u043d\u0430\u0446\u0438\u044f";
+        case 3:
+            return L"\u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0438\u0435 "
+                   L"\u0440\u0430\u0431\u043e\u0442\u044b";
+        default: {
+            wchar_t buffer[32];
+            swprintf_s(buffer, L"%lu", value);
+            return buffer;
+        }
+    }
+}
+
+void UpdateButtonVisual() {
+    if (!g_button || !g_icon) {
+        return;
+    }
+
+    LidSetting setting = ReadLidSetting();
+    std::wstring glyph;
+    std::wstring accessibleName;
+    std::wstring tooltip;
+
+    bool showOperationError =
+        g_lastOperationError != ERROR_SUCCESS &&
+        GetTickCount64() < g_lastOperationErrorExpiresAt;
+    if (showOperationError) {
+        glyph = L"!";
+        accessibleName =
+            L"\u041e\u0448\u0438\u0431\u043a\u0430 "
+            L"\u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f "
+            L"\u0440\u0435\u0436\u0438\u043c\u0430 \u043a\u0440\u044b\u0448\u043a\u0438";
+        tooltip =
+            L"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c "
+            L"\u0438\u0437\u043c\u0435\u043d\u0438\u0442\u044c "
+            L"\u0440\u0435\u0436\u0438\u043c:\n" +
+            FormatError(g_lastOperationError);
+    } else if (setting.mode == LidMode::Sleep) {
+        glyph = L"\xE708";
+        accessibleName =
+            L"\u0417\u0430\u043a\u0440\u044b\u0442\u0438\u0435 "
+            L"\u043a\u0440\u044b\u0448\u043a\u0438: \u0441\u043e\u043d";
+        tooltip =
+            accessibleName +
+            L"\n\u041e\u0442 \u0441\u0435\u0442\u0438 \u0438 "
+            L"\u043e\u0442 \u0431\u0430\u0442\u0430\u0440\u0435\u0438"
+            L"\n\u041d\u0430\u0436\u043c\u0438\u0442\u0435: "
+            L"\u043d\u0438\u0447\u0435\u0433\u043e "
+            L"\u043d\u0435 \u0434\u0435\u043b\u0430\u0442\u044c";
+    } else if (setting.mode == LidMode::DoNothing) {
+        glyph = L"\xE733";
+        accessibleName =
+            L"\u0417\u0430\u043a\u0440\u044b\u0442\u0438\u0435 "
+            L"\u043a\u0440\u044b\u0448\u043a\u0438: "
+            L"\u043d\u0438\u0447\u0435\u0433\u043e "
+            L"\u043d\u0435 \u0434\u0435\u043b\u0430\u0442\u044c";
+        tooltip =
+            accessibleName +
+            L"\n\u041e\u0442 \u0441\u0435\u0442\u0438 \u0438 "
+            L"\u043e\u0442 \u0431\u0430\u0442\u0430\u0440\u0435\u0438"
+            L"\n\u041d\u0430\u0436\u043c\u0438\u0442\u0435: "
+            L"\u0441\u043e\u043d";
+    } else if (setting.mode == LidMode::Mixed) {
+        glyph = L"?";
+        accessibleName =
+            L"\u0420\u0435\u0436\u0438\u043c\u044b "
+            L"\u0437\u0430\u043a\u0440\u044b\u0442\u0438\u044f "
+            L"\u043a\u0440\u044b\u0448\u043a\u0438 "
+            L"\u0440\u0430\u0437\u043b\u0438\u0447\u0430\u044e\u0442\u0441\u044f";
+        tooltip =
+            accessibleName +
+            L"\n\u041e\u0442 \u0441\u0435\u0442\u0438: " +
+            PowerValueName(setting.acValue) +
+            L"\n\u041e\u0442 \u0431\u0430\u0442\u0430\u0440\u0435\u0438: " +
+            PowerValueName(setting.dcValue) +
+            L"\n\u041d\u0430\u0436\u043c\u0438\u0442\u0435: "
+            L"\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c "
+            L"\u0441\u043e\u043d \u0434\u043b\u044f "
+            L"\u043e\u0431\u043e\u0438\u0445 \u0440\u0435\u0436\u0438\u043c\u043e\u0432";
+    } else {
+        glyph = L"!";
+        accessibleName =
+            L"\u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0430 "
+            L"\u0437\u0430\u043a\u0440\u044b\u0442\u0438\u044f "
+            L"\u043a\u0440\u044b\u0448\u043a\u0438 "
+            L"\u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430";
+        tooltip =
+            accessibleName +
+            L"\n" + FormatError(setting.error);
+    }
+
+    g_icon.Glyph(glyph);
+    AutomationProperties::SetName(g_button, accessibleName);
+    AutomationProperties::SetHelpText(g_button, tooltip);
+    ToolTipService::SetToolTip(
+        g_button,
+        winrt::box_value(winrt::hstring(tooltip)));
+}
+
+void OnButtonClick() {
+    LidSetting current = ReadLidSetting();
+    DWORD target = current.mode == LidMode::Sleep
+                       ? kDoNothingValue
+                       : kSleepValue;
+    DWORD error = WriteLidMode(target);
+
+    if (error == ERROR_SUCCESS) {
+        g_lastOperationError = ERROR_SUCCESS;
+        g_lastOperationErrorExpiresAt = 0;
+        Wh_Log(L"Lid close action changed to %ls",
+               target == kSleepValue ? L"sleep" : L"do nothing");
+    } else {
+        g_lastOperationError = error;
+        g_lastOperationErrorExpiresAt = GetTickCount64() + 8000;
+        Wh_Log(L"Failed to change lid close action: %lu (%ls)",
+               error,
+               FormatError(error).c_str());
+    }
+
+    UpdateButtonVisual();
+}
+
+void ReleaseButtonReferences() {
+    if (g_button) {
+        try {
+            if (g_clickToken.value) {
+                g_button.Click(g_clickToken);
+            }
+            if (g_pointerEnteredToken.value) {
+                g_button.PointerEntered(g_pointerEnteredToken);
+            }
+        } catch (...) {
+        }
+    }
+
+    g_clickToken = {};
+    g_pointerEnteredToken = {};
+    g_icon = nullptr;
+    g_button = nullptr;
+    g_injectionRoot = nullptr;
+    g_injectionParent = nullptr;
+}
+
+bool IsCurrentRootInGrid(Grid const& trayGrid) {
+    if (!trayGrid || !g_injectionRoot ||
+        g_injectionParent != trayGrid) {
+        return false;
+    }
+
+    uint32_t index = 0;
+    return trayGrid.Children().IndexOf(g_injectionRoot, index);
+}
+
+void RemoveRootAndColumn(Grid const& trayGrid,
+                         FrameworkElement const& root) {
+    uint32_t rootIndex = 0;
+    if (!trayGrid || !root ||
+        !trayGrid.Children().IndexOf(root, rootIndex)) {
+        return;
+    }
+
+    int column = Grid::GetColumn(root);
+    trayGrid.Children().RemoveAt(rootIndex);
+
+    if (column < 0 ||
+        column >= static_cast<int>(
+                      trayGrid.ColumnDefinitions().Size())) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < trayGrid.Children().Size(); i++) {
+        auto child =
+            trayGrid.Children().GetAt(i).try_as<FrameworkElement>();
+        if (!child) {
+            continue;
+        }
+
+        int childColumn = Grid::GetColumn(child);
+        if (childColumn > column) {
+            Grid::SetColumn(child, childColumn - 1);
+        }
+    }
+
+    trayGrid.ColumnDefinitions().RemoveAt(column);
+}
+
+FrameworkElement FindInjectedRoot(Grid const& trayGrid) {
+    if (!trayGrid) {
+        return nullptr;
+    }
+
+    for (auto const& childObject : trayGrid.Children()) {
+        auto child = childObject.try_as<FrameworkElement>();
+        if (child && child.Name() == kRootName) {
+            return child;
+        }
+    }
+    return nullptr;
+}
+
+Grid BuildButtonRoot() {
+    Grid root;
+    root.Name(kRootName);
+    root.Margin({2, 0, 2, 0});
+    root.VerticalAlignment(VerticalAlignment::Center);
+    Canvas::SetZIndex(root, 10000);
+
+    Button button;
+    button.Width(38);
+    button.Height(32);
+    button.MinWidth(0);
+    button.Padding({0, 0, 0, 0});
+    button.HorizontalContentAlignment(HorizontalAlignment::Center);
+    button.VerticalContentAlignment(VerticalAlignment::Center);
+    button.IsTabStop(false);
+
+    FontIcon icon;
+    icon.FontFamily(
+        winrt::Windows::UI::Xaml::Media::FontFamily(
+            L"Segoe Fluent Icons"));
+    icon.FontSize(16);
+    button.Content(icon);
+
+    g_clickToken = button.Click(
+        [](winrt::Windows::Foundation::IInspectable const&,
+           RoutedEventArgs const&) {
+            if (!g_unloading) {
+                OnButtonClick();
+            }
+        });
+    g_pointerEnteredToken = button.PointerEntered(
+        [](winrt::Windows::Foundation::IInspectable const&,
+           wuxi::PointerRoutedEventArgs const&) {
+            if (!g_unloading) {
+                UpdateButtonVisual();
+            }
+        });
+
+    root.Children().Append(button);
+    g_injectionRoot = root;
+    g_button = button;
+    g_icon = icon;
+    return root;
+}
+
+bool EnsureButtonInjected() {
+    Grid trayGrid{nullptr};
+    Grid newRoot{nullptr};
+    bool columnInserted = false;
+
+    try {
+        trayGrid = FindSystemTrayGrid();
+        if (!trayGrid) {
+            return false;
+        }
+
+        if (IsCurrentRootInGrid(trayGrid)) {
+            UpdateButtonVisual();
+            return true;
+        }
+
+        ReleaseButtonReferences();
+
+        while (auto orphan = FindInjectedRoot(trayGrid)) {
+            RemoveRootAndColumn(trayGrid, orphan);
+        }
+
+        newRoot = BuildButtonRoot();
+
+        ColumnDefinition column;
+        column.Width({1, GridUnitType::Auto});
+        trayGrid.ColumnDefinitions().InsertAt(0, column);
+        columnInserted = true;
+        for (uint32_t i = 0; i < trayGrid.Children().Size(); i++) {
+            auto child =
+                trayGrid.Children().GetAt(i).try_as<FrameworkElement>();
+            if (child) {
+                Grid::SetColumn(child, Grid::GetColumn(child) + 1);
+            }
+        }
+
+        Grid::SetColumn(newRoot, 0);
+        trayGrid.Children().Append(newRoot);
+        g_injectionParent = trayGrid;
+        UpdateButtonVisual();
+        Wh_Log(L"Lid closing mode button injected");
+        return true;
+    } catch (const winrt::hresult_error& error) {
+        Wh_Log(L"Button injection failed: 0x%08X (%ls)",
+               static_cast<unsigned>(error.code().value),
+               error.message().c_str());
+    } catch (...) {
+        Wh_Log(L"Button injection failed with an unknown exception");
+    }
+
+    if (trayGrid && columnInserted) {
+        try {
+            uint32_t rootIndex = 0;
+            if (newRoot &&
+                trayGrid.Children().IndexOf(newRoot, rootIndex)) {
+                trayGrid.Children().RemoveAt(rootIndex);
+            }
+            for (uint32_t i = 0; i < trayGrid.Children().Size(); i++) {
+                auto child =
+                    trayGrid.Children().GetAt(i)
+                        .try_as<FrameworkElement>();
+                if (child && Grid::GetColumn(child) > 0) {
+                    Grid::SetColumn(child, Grid::GetColumn(child) - 1);
+                }
+            }
+            if (trayGrid.ColumnDefinitions().Size() > 0) {
+                trayGrid.ColumnDefinitions().RemoveAt(0);
+            }
+        } catch (...) {
+            Wh_Log(L"Failed to roll back taskbar column injection");
+        }
+    }
+
+    ReleaseButtonReferences();
+    return false;
+}
+
+void RemoveButton() {
+    try {
+        Grid trayGrid = FindSystemTrayGrid();
+        if (trayGrid) {
+            if (IsCurrentRootInGrid(trayGrid)) {
+                auto root = g_injectionRoot;
+                ReleaseButtonReferences();
+                RemoveRootAndColumn(trayGrid, root);
+                return;
+            }
+
+            while (auto orphan = FindInjectedRoot(trayGrid)) {
+                RemoveRootAndColumn(trayGrid, orphan);
+            }
+        }
+    } catch (...) {
+        Wh_Log(L"Failed to remove the lid closing mode button cleanly");
+    }
+
+    ReleaseButtonReferences();
+}
+
+void EnsureButtonOnTaskbarThread(void*) {
+    if (!g_unloading) {
+        EnsureButtonInjected();
+    }
+}
+
+void RemoveButtonOnTaskbarThread(void*) {
+    RemoveButton();
+}
+
+void SyncButtonWithTaskbar() {
+    HWND hWnd = FindCurrentProcessTaskbarWnd();
+    if (!hWnd) {
+        return;
+    }
+
+    g_taskbarWnd = hWnd;
+    if (!RunFromWindowThread(
+            hWnd, EnsureButtonOnTaskbarThread, nullptr)) {
+        Wh_Log(L"Failed to marshal button update to the taskbar thread");
+    }
+}
+
+DWORD WINAPI MonitorThreadProc(void*) {
+    while (!g_unloading) {
+        SyncButtonWithTaskbar();
+
+        DWORD waitResult = WaitForSingleObject(
+            g_monitorStopEvent, kRefreshIntervalMs);
+        if (waitResult != WAIT_TIMEOUT) {
+            break;
+        }
+    }
+    return 0;
+}
+
+bool ResolveTaskbarSymbols() {
+    HMODULE taskbarModule = LoadLibraryExW(
+        L"taskbar.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!taskbarModule) {
+        Wh_Log(L"Failed to load taskbar.dll");
+        return false;
+    }
+
+    WindhawkUtils::SYMBOL_HOOK hooks[] = {
+        {
+            {LR"(const CTaskBand::`vftable'{for `ITaskListWndSite'})"},
+            &CTaskBand_ITaskListWndSite_vftable,
+        },
+        {
+            {LR"(public: virtual class std::shared_ptr<class TaskbarHost> __cdecl CTaskBand::GetTaskbarHost(void)const )"},
+            &CTaskBand_GetTaskbarHost_Original,
+        },
+        {
+            {LR"(public: int __cdecl TaskbarHost::FrameHeight(void)const )"},
+            &TaskbarHost_FrameHeight_Original,
+        },
+        {
+            {LR"(public: void __cdecl std::_Ref_count_base::_Decref(void))"},
+            &std__Ref_count_base__Decref_Original,
+        },
+    };
+
+    return WindhawkUtils::HookSymbols(
+        taskbarModule, hooks, ARRAYSIZE(hooks));
+}
+
+}  // namespace
+
+BOOL Wh_ModInit() {
+    Wh_Log(L"Initializing Lid Closing Mode Button");
+    if (!ResolveTaskbarSymbols()) {
+        Wh_Log(L"Failed to resolve taskbar symbols");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+void Wh_ModAfterInit() {
+    g_monitorStopEvent =
+        CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_monitorStopEvent) {
+        Wh_Log(L"Failed to create the monitor stop event: %lu",
+               GetLastError());
+        SyncButtonWithTaskbar();
+        return;
+    }
+
+    g_monitorThread =
+        CreateThread(nullptr, 0, MonitorThreadProc, nullptr, 0, nullptr);
+    if (!g_monitorThread) {
+        Wh_Log(L"Failed to create the monitor thread: %lu",
+               GetLastError());
+        SyncButtonWithTaskbar();
+    }
+}
+
+void Wh_ModUninit() {
+    g_unloading = true;
+
+    if (g_monitorStopEvent) {
+        SetEvent(g_monitorStopEvent);
+    }
+    if (g_monitorThread) {
+        WaitForSingleObject(g_monitorThread, INFINITE);
+        CloseHandle(g_monitorThread);
+        g_monitorThread = nullptr;
+    }
+    if (g_monitorStopEvent) {
+        CloseHandle(g_monitorStopEvent);
+        g_monitorStopEvent = nullptr;
+    }
+
+    HWND hWnd = g_taskbarWnd;
+    if (!hWnd || !IsWindow(hWnd)) {
+        hWnd = FindCurrentProcessTaskbarWnd();
+    }
+    if (hWnd) {
+        RunFromWindowThread(
+            hWnd, RemoveButtonOnTaskbarThread, nullptr);
+    } else {
+        ReleaseButtonReferences();
+    }
+
+    Wh_Log(L"Lid Closing Mode Button unloaded");
+}
