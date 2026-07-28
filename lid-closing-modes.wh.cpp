@@ -2,7 +2,7 @@
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
 // @description     Adds a taskbar button that switches lid closing between sleep and do nothing
-// @version         1.4.0
+// @version         1.5.0
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
@@ -29,9 +29,9 @@ immediately without polling.
 The separate behavior can be disabled in the mod settings. In linked mode,
 the button displays and changes the plugged-in and battery values together.
 
-The button uses taskbar-style visual states: transparent at rest, a subtle
-neutral background on hover, and a darker pressed state. The colors adapt to
-light and dark themes.
+The button mirrors the native Windows 11 system tray button geometry and
+visual states, including its hover border, pressed state, transition timing,
+and light, dark, and high contrast theme resources.
 
 The moon icon means **Sleep**. The blocked icon means **Do nothing**. Other
 lid actions show a question mark, and the next click sets the current power
@@ -68,6 +68,7 @@ This mod targets the Windows 11 XAML taskbar.
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Input.h>
+#include <winrt/Windows.UI.Xaml.Markup.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 
 #include <atomic>
@@ -79,6 +80,7 @@ This mod targets the Windows 11 XAML taskbar.
 using namespace winrt::Windows::UI::Xaml;
 using namespace winrt::Windows::UI::Xaml::Automation;
 using namespace winrt::Windows::UI::Xaml::Controls;
+using namespace winrt::Windows::UI::Xaml::Markup;
 using namespace winrt::Windows::UI::Xaml::Media;
 
 namespace wuxi = winrt::Windows::UI::Xaml::Input;
@@ -88,6 +90,146 @@ namespace {
 constexpr wchar_t kRootName[] = L"LidClosingModes_Root";
 constexpr DWORD kDoNothingValue = 0;
 constexpr DWORD kSleepValue = 1;
+
+// Adapted from the native NormalIconView style in SystemTrayResources.xbf.
+constexpr wchar_t kTaskbarButtonResourcesXaml[] = LR"xml(
+<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <ResourceDictionary.ThemeDictionaries>
+        <ResourceDictionary x:Key="Light">
+            <SolidColorBrush x:Key="LidButtonBackground"
+                Color="#00FFFFFF" />
+            <SolidColorBrush x:Key="LidButtonBackgroundPointerOver"
+                Color="#80FFFFFF" />
+            <SolidColorBrush x:Key="LidButtonBackgroundPressed"
+                Color="#4CFFFFFF" />
+            <SolidColorBrush x:Key="LidButtonBorderBrush"
+                Color="#00FFFFFF" />
+            <LinearGradientBrush
+                x:Key="LidButtonBorderBrushPointerOver"
+                MappingMode="Absolute"
+                StartPoint="0,0"
+                EndPoint="0,3">
+                <LinearGradientBrush.RelativeTransform>
+                    <ScaleTransform ScaleY="-1" CenterY="0.5" />
+                </LinearGradientBrush.RelativeTransform>
+                <GradientStop Offset="0.33" Color="#0F000000" />
+                <GradientStop Offset="1" Color="#05000000" />
+            </LinearGradientBrush>
+            <StaticResource x:Key="LidButtonForeground"
+                ResourceKey="TextFillColorPrimaryBrush" />
+            <StaticResource x:Key="LidButtonForegroundPointerOver"
+                ResourceKey="TextFillColorPrimaryBrush" />
+            <StaticResource x:Key="LidButtonForegroundPressed"
+                ResourceKey="TextFillColorSecondaryBrush" />
+        </ResourceDictionary>
+        <ResourceDictionary x:Key="Dark">
+            <SolidColorBrush x:Key="LidButtonBackground"
+                Color="#00FFFFFF" />
+            <SolidColorBrush x:Key="LidButtonBackgroundPointerOver"
+                Color="#0FFFFFFF" />
+            <SolidColorBrush x:Key="LidButtonBackgroundPressed"
+                Color="#0AFFFFFF" />
+            <SolidColorBrush x:Key="LidButtonBorderBrush"
+                Color="#00FFFFFF" />
+            <LinearGradientBrush
+                x:Key="LidButtonBorderBrushPointerOver"
+                MappingMode="Absolute"
+                StartPoint="0,0"
+                EndPoint="0,3">
+                <GradientStop Offset="0.33" Color="#1AFFFFFF" />
+                <GradientStop Offset="1" Color="#0FFFFFFF" />
+            </LinearGradientBrush>
+            <StaticResource x:Key="LidButtonForeground"
+                ResourceKey="TextFillColorPrimaryBrush" />
+            <StaticResource x:Key="LidButtonForegroundPointerOver"
+                ResourceKey="TextFillColorPrimaryBrush" />
+            <StaticResource x:Key="LidButtonForegroundPressed"
+                ResourceKey="TextFillColorSecondaryBrush" />
+        </ResourceDictionary>
+        <ResourceDictionary x:Key="HighContrast">
+            <StaticResource x:Key="LidButtonBackground"
+                ResourceKey="SystemColorWindowColorBrush" />
+            <StaticResource x:Key="LidButtonBackgroundPointerOver"
+                ResourceKey="SystemColorHighlightTextColorBrush" />
+            <StaticResource x:Key="LidButtonBackgroundPressed"
+                ResourceKey="SystemColorWindowColorBrush" />
+            <StaticResource x:Key="LidButtonBorderBrush"
+                ResourceKey="SystemColorWindowColorBrush" />
+            <StaticResource x:Key="LidButtonBorderBrushPointerOver"
+                ResourceKey="SystemColorHighlightColorBrush" />
+            <StaticResource x:Key="LidButtonForeground"
+                ResourceKey="SystemColorWindowTextColorBrush" />
+            <StaticResource x:Key="LidButtonForegroundPointerOver"
+                ResourceKey="SystemColorHighlightColorBrush" />
+            <StaticResource x:Key="LidButtonForegroundPressed"
+                ResourceKey="SystemColorHighlightColorBrush" />
+        </ResourceDictionary>
+    </ResourceDictionary.ThemeDictionaries>
+
+    <ControlTemplate
+        x:Key="LidTaskbarButtonTemplate"
+        TargetType="Button">
+        <Grid x:Name="ContainerGrid" Background="#00FFFFFF">
+            <VisualStateManager.VisualStateGroups>
+                <VisualStateGroup x:Name="CommonStates">
+                    <VisualState x:Name="Normal" />
+                    <VisualState x:Name="PointerOver">
+                        <VisualState.Setters>
+                            <Setter
+                                Target="BackgroundBorder.Background"
+                                Value="{ThemeResource LidButtonBackgroundPointerOver}" />
+                            <Setter
+                                Target="BackgroundBorder.BorderBrush"
+                                Value="{ThemeResource LidButtonBorderBrushPointerOver}" />
+                            <Setter
+                                Target="ContentPresenter.Foreground"
+                                Value="{ThemeResource LidButtonForegroundPointerOver}" />
+                        </VisualState.Setters>
+                    </VisualState>
+                    <VisualState x:Name="Pressed">
+                        <VisualState.Setters>
+                            <Setter
+                                Target="BackgroundBorder.Background"
+                                Value="{ThemeResource LidButtonBackgroundPressed}" />
+                            <Setter
+                                Target="BackgroundBorder.BorderBrush"
+                                Value="{ThemeResource LidButtonBorderBrushPointerOver}" />
+                            <Setter
+                                Target="ContentPresenter.Foreground"
+                                Value="{ThemeResource LidButtonForegroundPressed}" />
+                        </VisualState.Setters>
+                    </VisualState>
+                </VisualStateGroup>
+            </VisualStateManager.VisualStateGroups>
+
+            <Border
+                x:Name="BackgroundBorder"
+                Margin="{TemplateBinding Padding}"
+                Background="{ThemeResource LidButtonBackground}"
+                BackgroundSizing="InnerBorderEdge"
+                BorderBrush="{ThemeResource LidButtonBorderBrush}"
+                BorderThickness="1"
+                CornerRadius="{ThemeResource ControlCornerRadius}"
+                IsTemplateFocusTarget="True">
+                <Border.BackgroundTransition>
+                    <BrushTransition Duration="0:0:0.083" />
+                </Border.BackgroundTransition>
+            </Border>
+
+            <ContentPresenter
+                x:Name="ContentPresenter"
+                Content="{TemplateBinding Content}"
+                ContentTemplate="{TemplateBinding ContentTemplate}"
+                ContentTransitions="{TemplateBinding ContentTransitions}"
+                Foreground="{ThemeResource LidButtonForeground}"
+                HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                VerticalAlignment="{TemplateBinding VerticalContentAlignment}" />
+        </Grid>
+    </ControlTemplate>
+</ResourceDictionary>
+)xml";
 
 #ifndef DEVICE_NOTIFY_CALLBACK
 #define DEVICE_NOTIFY_CALLBACK 2
@@ -171,13 +313,7 @@ Button g_button{nullptr};
 FontIcon g_icon{nullptr};
 winrt::event_token g_clickToken{};
 winrt::event_token g_pointerEnteredToken{};
-winrt::event_token g_actualThemeChangedToken{};
 std::list<FrameworkElement::Loaded_revoker> g_iconLoadedRevokers;
-
-SolidColorBrush g_buttonNormalBrush{nullptr};
-SolidColorBrush g_buttonHoverBrush{nullptr};
-SolidColorBrush g_buttonPressedBrush{nullptr};
-SolidColorBrush g_buttonBorderBrush{nullptr};
 
 DWORD g_lastOperationError = ERROR_SUCCESS;
 ULONGLONG g_lastOperationErrorExpiresAt = 0;
@@ -724,75 +860,26 @@ std::wstring PowerScopeName(LidSetting const& setting) {
     return PowerSourceName(setting.source);
 }
 
-void SetButtonBrushResource(Button const& button,
-                            wchar_t const* key,
-                            Brush const& brush) {
-    button.Resources().Insert(winrt::box_value(key), brush);
-}
-
-bool IsButtonThemeLight() {
-    if (!g_button) {
-        return false;
-    }
-
-    ElementTheme theme = g_button.ActualTheme();
-    if (theme == ElementTheme::Light) {
-        return true;
-    }
-    if (theme == ElementTheme::Dark) {
-        return false;
-    }
-
-    return Application::Current().RequestedTheme() ==
-           ApplicationTheme::Light;
-}
-
-void UpdateButtonThemeColors() {
-    if (!g_buttonNormalBrush || !g_buttonHoverBrush ||
-        !g_buttonPressedBrush || !g_buttonBorderBrush) {
-        return;
-    }
-
-    bool light = IsButtonThemeLight();
-    g_buttonNormalBrush.Color({0x00, 0x00, 0x00, 0x00});
-    g_buttonBorderBrush.Color({0x00, 0x00, 0x00, 0x00});
-
-    if (light) {
-        // Black overlays on a light taskbar.
-        g_buttonHoverBrush.Color({0x0F, 0x00, 0x00, 0x00});
-        g_buttonPressedBrush.Color({0x19, 0x00, 0x00, 0x00});
-    } else {
-        // White overlays on a dark taskbar. Pressed is darker than hover.
-        g_buttonHoverBrush.Color({0x18, 0xFF, 0xFF, 0xFF});
-        g_buttonPressedBrush.Color({0x0F, 0xFF, 0xFF, 0xFF});
-    }
-}
-
 void ApplyTaskbarButtonStyle(Button const& button) {
-    g_buttonNormalBrush = SolidColorBrush();
-    g_buttonHoverBrush = SolidColorBrush();
-    g_buttonPressedBrush = SolidColorBrush();
-    g_buttonBorderBrush = SolidColorBrush();
+    auto resources =
+        XamlReader::Load(kTaskbarButtonResourcesXaml)
+            .as<ResourceDictionary>();
+    button.Resources().MergedDictionaries().Append(resources);
+    button.Template(
+        resources.Lookup(
+                     winrt::box_value(
+                         L"LidTaskbarButtonTemplate"))
+            .as<ControlTemplate>());
 
-    UpdateButtonThemeColors();
-
-    button.Background(g_buttonNormalBrush);
-    button.BorderBrush(g_buttonBorderBrush);
-    button.BorderThickness({0, 0, 0, 0});
-    button.CornerRadius({4, 4, 4, 4});
-
-    SetButtonBrushResource(
-        button, L"ButtonBackground", g_buttonNormalBrush);
-    SetButtonBrushResource(
-        button, L"ButtonBackgroundPointerOver", g_buttonHoverBrush);
-    SetButtonBrushResource(
-        button, L"ButtonBackgroundPressed", g_buttonPressedBrush);
-    SetButtonBrushResource(
-        button, L"ButtonBorderBrush", g_buttonBorderBrush);
-    SetButtonBrushResource(
-        button, L"ButtonBorderBrushPointerOver", g_buttonBorderBrush);
-    SetButtonBrushResource(
-        button, L"ButtonBorderBrushPressed", g_buttonBorderBrush);
+    button.MinWidth(32);
+    button.Padding({0, 4, 0, 4});
+    button.VerticalAlignment(VerticalAlignment::Stretch);
+    button.HorizontalAlignment(HorizontalAlignment::Stretch);
+    button.VerticalContentAlignment(VerticalAlignment::Center);
+    button.HorizontalContentAlignment(HorizontalAlignment::Center);
+    button.UseSystemFocusVisuals(true);
+    button.FocusVisualMargin({-2, -2, -2, -2});
+    button.FocusVisualSecondaryThickness({0, 0, 0, 0});
 }
 
 void UpdateButtonVisual() {
@@ -946,21 +1033,12 @@ void ReleaseButtonReferences() {
             if (g_pointerEnteredToken.value) {
                 g_button.PointerEntered(g_pointerEnteredToken);
             }
-            if (g_actualThemeChangedToken.value) {
-                g_button.ActualThemeChanged(
-                    g_actualThemeChangedToken);
-            }
         } catch (...) {
         }
     }
 
     g_clickToken = {};
     g_pointerEnteredToken = {};
-    g_actualThemeChangedToken = {};
-    g_buttonNormalBrush = nullptr;
-    g_buttonHoverBrush = nullptr;
-    g_buttonPressedBrush = nullptr;
-    g_buttonBorderBrush = nullptr;
     g_icon = nullptr;
     g_button = nullptr;
     g_injectionRoot = nullptr;
@@ -1027,17 +1105,11 @@ FrameworkElement FindInjectedRoot(Grid const& trayGrid) {
 Grid BuildButtonRoot() {
     Grid root;
     root.Name(kRootName);
-    root.Margin({2, 0, 2, 0});
-    root.VerticalAlignment(VerticalAlignment::Center);
+    root.VerticalAlignment(VerticalAlignment::Stretch);
+    root.HorizontalAlignment(HorizontalAlignment::Stretch);
     Canvas::SetZIndex(root, 10000);
 
     Button button;
-    button.Width(38);
-    button.Height(32);
-    button.MinWidth(0);
-    button.Padding({0, 0, 0, 0});
-    button.HorizontalContentAlignment(HorizontalAlignment::Center);
-    button.VerticalContentAlignment(VerticalAlignment::Center);
     button.IsTabStop(false);
 
     FontIcon icon;
@@ -1065,14 +1137,6 @@ Grid BuildButtonRoot() {
                 UpdateButtonVisual();
             }
         });
-    g_actualThemeChangedToken = button.ActualThemeChanged(
-        [](FrameworkElement const&,
-           winrt::Windows::Foundation::IInspectable const&) {
-            if (!g_unloading) {
-                UpdateButtonThemeColors();
-            }
-        });
-
     root.Children().Append(button);
     g_injectionRoot = root;
     return root;
@@ -1117,7 +1181,6 @@ bool EnsureButtonInjected() {
         Grid::SetColumn(newRoot, 0);
         trayGrid.Children().Append(newRoot);
         g_injectionParent = trayGrid;
-        UpdateButtonThemeColors();
         UpdateButtonVisual();
         Wh_Log(L"Lid closing mode button injected");
         return true;

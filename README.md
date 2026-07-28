@@ -16,9 +16,10 @@ It follows the current power source:
 Connecting or disconnecting the charger updates the button immediately. A moon
 icon means Sleep, and a blocked icon means Do nothing.
 
-The button matches the taskbar interaction style: no visible background or
-border at rest, a subtle neutral background on hover, and a darker pressed
-state. These colors update automatically for light and dark themes.
+The button mirrors the native Windows 11 system tray button style: the same
+32-pixel layout width, inset background, one-pixel gradient hover border,
+pressed state, corner radius, and 83 ms background transition. Native theme
+resources cover light, dark, and high contrast modes automatically.
 
 ## Settings
 
