@@ -2,7 +2,7 @@
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
 // @description     Adds a taskbar button that switches lid closing between sleep and do nothing
-// @version         1.5.2
+// @version         1.6.0
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
@@ -15,16 +15,16 @@
 # Lid Closing Mode Button
 
 Adds a compact button immediately to the left of the Windows 11 system tray.
-The button switches the active power plan's **When I close the lid** action
-between:
+The button switches the **When I close the lid** action between:
 
 - Sleep
 - Do nothing
 
 The button follows the current power source. While plugged in, it displays and
 changes only the **Plugged in** value. On battery, it displays and changes only
-the **On battery** value. Switching the power source updates the button
-immediately without polling.
+the **On battery** value. The selected value is written to every power plan,
+matching the global settings shown by `powercfg.cpl`. Switching the power
+source updates the button immediately without polling.
 
 The separate behavior can be disabled in the mod settings. In linked mode,
 the button displays and changes the plugged-in and battery values together.
@@ -71,11 +71,13 @@ This mod targets the Windows 11 XAML taskbar.
 #include <winrt/Windows.UI.Xaml.Input.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cwchar>
 #include <functional>
 #include <list>
 #include <string>
+#include <vector>
 
 using namespace winrt::Windows::UI::Xaml;
 using namespace winrt::Windows::UI::Xaml::Automation;
@@ -161,6 +163,12 @@ struct LidSetting {
     DWORD dcValue = 0;
     DWORD activeValue = 0;
     DWORD error = ERROR_SUCCESS;
+};
+
+struct PowerSchemeLidValues {
+    GUID scheme{};
+    DWORD acValue = 0;
+    DWORD dcValue = 0;
 };
 
 std::atomic<bool> g_unloading{false};
@@ -614,6 +622,81 @@ DWORD WriteLidModeForSource(const GUID* activeScheme,
     return ERROR_NOT_READY;
 }
 
+DWORD EnumeratePowerSchemeLidValues(
+    std::vector<PowerSchemeLidValues>* schemes,
+    bool readAc,
+    bool readDc) {
+    if (!schemes) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    schemes->clear();
+    for (ULONG index = 0;; index++) {
+        PowerSchemeLidValues values;
+        DWORD schemeSize = sizeof(values.scheme);
+        DWORD error = PowerEnumerate(
+            nullptr,
+            nullptr,
+            nullptr,
+            ACCESS_SCHEME,
+            index,
+            reinterpret_cast<UCHAR*>(&values.scheme),
+            &schemeSize);
+        if (error == ERROR_NO_MORE_ITEMS) {
+            return schemes->empty() ? ERROR_NOT_FOUND : ERROR_SUCCESS;
+        }
+        if (error != ERROR_SUCCESS) {
+            return error;
+        }
+        if (schemeSize != sizeof(values.scheme)) {
+            return ERROR_INVALID_DATA;
+        }
+
+        if (readAc) {
+            error = PowerReadACValueIndex(
+                nullptr,
+                &values.scheme,
+                &kSystemButtonSubgroup,
+                &kLidCloseAction,
+                &values.acValue);
+            if (error != ERROR_SUCCESS) {
+                return error;
+            }
+        }
+        if (readDc) {
+            error = PowerReadDCValueIndex(
+                nullptr,
+                &values.scheme,
+                &kSystemButtonSubgroup,
+                &kLidCloseAction,
+                &values.dcValue);
+            if (error != ERROR_SUCCESS) {
+                return error;
+            }
+        }
+
+        schemes->push_back(values);
+    }
+}
+
+void RestoreLidModeForSource(
+    const std::vector<PowerSchemeLidValues>& schemes,
+    PowerSource source,
+    size_t count) {
+    count = (std::min)(count, schemes.size());
+    for (size_t i = 0; i < count; i++) {
+        DWORD oldValue = source == PowerSource::PluggedIn
+                             ? schemes[i].acValue
+                             : schemes[i].dcValue;
+        DWORD error = WriteLidModeForSource(
+            &schemes[i].scheme, source, oldValue);
+        if (error != ERROR_SUCCESS) {
+            Wh_Log(L"Failed to restore a power plan's lid action: %lu",
+                   error);
+        }
+    }
+}
+
 DWORD WriteLidMode(PowerSource source, DWORD value) {
     if (source == PowerSource::Unknown) {
         return ERROR_NOT_READY;
@@ -624,93 +707,126 @@ DWORD WriteLidMode(PowerSource source, DWORD value) {
         return sourceError == ERROR_SUCCESS ? ERROR_RETRY : sourceError;
     }
 
+    std::vector<PowerSchemeLidValues> schemes;
+    DWORD error = EnumeratePowerSchemeLidValues(
+        &schemes,
+        source == PowerSource::PluggedIn,
+        source == PowerSource::OnBattery);
+    if (error != ERROR_SUCCESS) {
+        return error;
+    }
+
     GUID* activeScheme = nullptr;
-    DWORD error = PowerGetActiveScheme(nullptr, &activeScheme);
+    error = PowerGetActiveScheme(nullptr, &activeScheme);
     if (error != ERROR_SUCCESS || !activeScheme) {
         return error != ERROR_SUCCESS ? error : ERROR_INVALID_DATA;
     }
 
-    DWORD oldValue = 0;
-    error = ReadLidModeForSource(activeScheme, source, &oldValue);
-    if (error != ERROR_SUCCESS) {
-        LocalFree(activeScheme);
-        return error;
+    size_t writtenCount = 0;
+    for (auto const& scheme : schemes) {
+        error =
+            WriteLidModeForSource(&scheme.scheme, source, value);
+        if (error != ERROR_SUCCESS) {
+            break;
+        }
+        writtenCount++;
     }
 
-    error = WriteLidModeForSource(activeScheme, source, value);
     if (error != ERROR_SUCCESS) {
-        LocalFree(activeScheme);
-        return error;
-    }
-
-    error = PowerSetActiveScheme(nullptr, activeScheme);
-
-    if (error != ERROR_SUCCESS) {
-        WriteLidModeForSource(activeScheme, source, oldValue);
-        PowerSetActiveScheme(nullptr, activeScheme);
+        RestoreLidModeForSource(schemes, source, writtenCount);
+    } else {
+        error = PowerSetActiveScheme(nullptr, activeScheme);
+        if (error != ERROR_SUCCESS) {
+            RestoreLidModeForSource(
+                schemes, source, schemes.size());
+            PowerSetActiveScheme(nullptr, activeScheme);
+        }
     }
 
     LocalFree(activeScheme);
     return error;
 }
 
+void RestoreLinkedLidModes(
+    const std::vector<PowerSchemeLidValues>& schemes,
+    size_t acCount,
+    size_t dcCount) {
+    acCount = (std::min)(acCount, schemes.size());
+    dcCount = (std::min)(dcCount, schemes.size());
+    for (size_t i = 0; i < dcCount; i++) {
+        DWORD error = PowerWriteDCValueIndex(
+            nullptr,
+            &schemes[i].scheme,
+            &kSystemButtonSubgroup,
+            &kLidCloseAction,
+            schemes[i].dcValue);
+        if (error != ERROR_SUCCESS) {
+            Wh_Log(L"Failed to restore a power plan's DC lid action: %lu",
+                   error);
+        }
+    }
+    for (size_t i = 0; i < acCount; i++) {
+        DWORD error = PowerWriteACValueIndex(
+            nullptr,
+            &schemes[i].scheme,
+            &kSystemButtonSubgroup,
+            &kLidCloseAction,
+            schemes[i].acValue);
+        if (error != ERROR_SUCCESS) {
+            Wh_Log(L"Failed to restore a power plan's AC lid action: %lu",
+                   error);
+        }
+    }
+}
+
 DWORD WriteLinkedLidMode(DWORD value) {
+    std::vector<PowerSchemeLidValues> schemes;
+    DWORD error =
+        EnumeratePowerSchemeLidValues(&schemes, true, true);
+    if (error != ERROR_SUCCESS) {
+        return error;
+    }
+
     GUID* activeScheme = nullptr;
-    DWORD error = PowerGetActiveScheme(nullptr, &activeScheme);
+    error = PowerGetActiveScheme(nullptr, &activeScheme);
     if (error != ERROR_SUCCESS || !activeScheme) {
         return error != ERROR_SUCCESS ? error : ERROR_INVALID_DATA;
     }
 
-    DWORD oldAcValue = 0;
-    DWORD oldDcValue = 0;
-    error = PowerReadACValueIndex(nullptr,
-                                  activeScheme,
-                                  &kSystemButtonSubgroup,
-                                  &kLidCloseAction,
-                                  &oldAcValue);
-    if (error == ERROR_SUCCESS) {
-        error = PowerReadDCValueIndex(nullptr,
-                                      activeScheme,
-                                      &kSystemButtonSubgroup,
-                                      &kLidCloseAction,
-                                      &oldDcValue);
-    }
-    if (error != ERROR_SUCCESS) {
-        LocalFree(activeScheme);
-        return error;
+    size_t acWrittenCount = 0;
+    size_t dcWrittenCount = 0;
+    for (auto const& scheme : schemes) {
+        error = PowerWriteACValueIndex(nullptr,
+                                       &scheme.scheme,
+                                       &kSystemButtonSubgroup,
+                                       &kLidCloseAction,
+                                       value);
+        if (error != ERROR_SUCCESS) {
+            break;
+        }
+        acWrittenCount++;
+
+        error = PowerWriteDCValueIndex(nullptr,
+                                       &scheme.scheme,
+                                       &kSystemButtonSubgroup,
+                                       &kLidCloseAction,
+                                       value);
+        if (error != ERROR_SUCCESS) {
+            break;
+        }
+        dcWrittenCount++;
     }
 
-    error = PowerWriteACValueIndex(nullptr,
-                                   activeScheme,
-                                   &kSystemButtonSubgroup,
-                                   &kLidCloseAction,
-                                   value);
     if (error != ERROR_SUCCESS) {
-        LocalFree(activeScheme);
-        return error;
-    }
-
-    error = PowerWriteDCValueIndex(nullptr,
-                                   activeScheme,
-                                   &kSystemButtonSubgroup,
-                                   &kLidCloseAction,
-                                   value);
-    if (error == ERROR_SUCCESS) {
+        RestoreLinkedLidModes(
+            schemes, acWrittenCount, dcWrittenCount);
+    } else {
         error = PowerSetActiveScheme(nullptr, activeScheme);
-    }
-
-    if (error != ERROR_SUCCESS) {
-        PowerWriteACValueIndex(nullptr,
-                               activeScheme,
-                               &kSystemButtonSubgroup,
-                               &kLidCloseAction,
-                               oldAcValue);
-        PowerWriteDCValueIndex(nullptr,
-                               activeScheme,
-                               &kSystemButtonSubgroup,
-                               &kLidCloseAction,
-                               oldDcValue);
-        PowerSetActiveScheme(nullptr, activeScheme);
+        if (error != ERROR_SUCCESS) {
+            RestoreLinkedLidModes(
+                schemes, schemes.size(), schemes.size());
+            PowerSetActiveScheme(nullptr, activeScheme);
+        }
     }
 
     LocalFree(activeScheme);
@@ -1053,11 +1169,13 @@ void OnButtonClick() {
         g_lastOperationError = ERROR_SUCCESS;
         g_lastOperationErrorExpiresAt = 0;
         if (current.separatePowerSources) {
-            Wh_Log(L"Lid close action changed to %ls for %ls",
+            Wh_Log(L"Lid close action changed to %ls for %ls "
+                   L"across all power plans",
                    target == kSleepValue ? L"sleep" : L"do nothing",
                    current.source == PowerSource::PluggedIn ? L"AC" : L"DC");
         } else {
-            Wh_Log(L"Lid close action changed to %ls for AC and DC",
+            Wh_Log(L"Lid close action changed to %ls for AC and DC "
+                   L"across all power plans",
                    target == kSleepValue ? L"sleep" : L"do nothing");
         }
     } else {

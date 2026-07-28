@@ -3,7 +3,7 @@
 A Windhawk mod for Windows 11 that adds one button immediately to the left of
 the system tray.
 
-The button toggles the active power plan's lid-close action between:
+The button toggles the lid-close action between:
 
 - Sleep
 - Do nothing
@@ -15,6 +15,10 @@ It follows the current power source:
 
 Connecting or disconnecting the charger updates the button immediately. A moon
 icon means Sleep, and a blocked icon means Do nothing.
+
+Changes are written to every power plan, matching the global lid settings shown
+by `powercfg.cpl`. The active plan is then reapplied so the new behavior takes
+effect immediately.
 
 The button mirrors the native Windows 11 system tray button style: the same
 32-pixel layout width, inset background, one-pixel gradient hover border,
