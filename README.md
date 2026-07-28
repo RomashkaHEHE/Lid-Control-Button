@@ -19,5 +19,7 @@ It updates both the plugged-in (AC) and battery (DC) values used by
    [`lid-closing-modes.wh.cpp`](lid-closing-modes.wh.cpp).
 4. Click **Compile Mod**, then enable it.
 
-The mod periodically rereads the active power plan and restores its taskbar
-button if Explorer rebuilds the Windows 11 XAML taskbar.
+The mod doesn't poll. It subscribes to Windows power-setting notifications and
+updates immediately when the lid action or active power plan changes. It also
+listens for system-tray XAML reconstruction events so the button is restored
+when Explorer rebuilds the Windows 11 taskbar.

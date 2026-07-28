@@ -2,7 +2,7 @@
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
 // @description     Adds a taskbar button that switches lid closing between sleep and do nothing
-// @version         1.0.0
+// @version         1.1.0
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
@@ -22,8 +22,8 @@ between:
 - Do nothing
 
 Both the **On battery** and **Plugged in** values are changed together. The
-button reads the active power plan periodically, so changes made in Power
-Options or by another utility are reflected automatically.
+button subscribes to Windows power-setting notifications, so changes made in
+Power Options or by another utility are reflected immediately without polling.
 
 The moon icon means **Sleep**. The blocked icon means **Do nothing**. If the
 two power-source values differ, the button shows a question mark and the next
@@ -36,6 +36,7 @@ This mod targets the Windows 11 XAML taskbar.
 #undef GetCurrentTime
 
 #include <powrprof.h>
+#include <powersetting.h>
 #include <unknwn.h>
 #include <winver.h>
 
@@ -53,6 +54,7 @@ This mod targets the Windows 11 XAML taskbar.
 #include <atomic>
 #include <cwchar>
 #include <functional>
+#include <list>
 #include <string>
 
 using namespace winrt::Windows::UI::Xaml;
@@ -67,7 +69,18 @@ namespace {
 constexpr wchar_t kRootName[] = L"LidClosingModes_Root";
 constexpr DWORD kDoNothingValue = 0;
 constexpr DWORD kSleepValue = 1;
-constexpr DWORD kRefreshIntervalMs = 2000;
+
+#ifndef DEVICE_NOTIFY_CALLBACK
+#define DEVICE_NOTIFY_CALLBACK 2
+#endif
+
+using DeviceNotifyCallbackRoutine =
+    ULONG(CALLBACK*)(PVOID context, ULONG type, PVOID setting);
+
+struct DeviceNotifySubscribeParameters {
+    DeviceNotifyCallbackRoutine Callback;
+    PVOID Context;
+};
 
 // GUID_SYSTEM_BUTTON_SUBGROUP
 constexpr GUID kSystemButtonSubgroup = {
@@ -85,6 +98,14 @@ constexpr GUID kLidCloseAction = {
     {0xa2, 0x7b, 0x47, 0x6b, 0x1d, 0x01, 0xc9, 0x36},
 };
 
+// GUID_ACTIVE_POWERSCHEME
+constexpr GUID kActivePowerScheme = {
+    0x31f9f286,
+    0x5084,
+    0x42fe,
+    {0xb7, 0x20, 0x2b, 0x02, 0x64, 0x99, 0x37, 0x63},
+};
+
 enum class LidMode {
     DoNothing,
     Sleep,
@@ -100,9 +121,11 @@ struct LidSetting {
 };
 
 std::atomic<bool> g_unloading{false};
-HWND g_taskbarWnd = nullptr;
-HANDLE g_monitorThread = nullptr;
-HANDLE g_monitorStopEvent = nullptr;
+std::atomic<HWND> g_taskbarWnd{nullptr};
+HPOWERNOTIFY g_lidCloseNotification = nullptr;
+HPOWERNOTIFY g_activeSchemeNotification = nullptr;
+std::atomic<unsigned> g_activePowerCallbacks{0};
+std::atomic<bool> g_systemTrayModuleHooked{false};
 
 Grid g_injectionRoot{nullptr};
 Grid g_injectionParent{nullptr};
@@ -110,6 +133,7 @@ Button g_button{nullptr};
 FontIcon g_icon{nullptr};
 winrt::event_token g_clickToken{};
 winrt::event_token g_pointerEnteredToken{};
+std::list<FrameworkElement::Loaded_revoker> g_iconLoadedRevokers;
 
 DWORD g_lastOperationError = ERROR_SUCCESS;
 ULONGLONG g_lastOperationErrorExpiresAt = 0;
@@ -127,6 +151,8 @@ std__Ref_count_base__Decref_t std__Ref_count_base__Decref_Original = nullptr;
 void* CTaskBand_ITaskListWndSite_vftable = nullptr;
 
 using RunFromWindowThreadProc = void (*)(void*);
+
+void SyncButtonWithTaskbar();
 
 bool RunFromWindowThread(HWND hWnd,
                          RunFromWindowThreadProc proc,
@@ -302,11 +328,12 @@ FrameworkElement FindChildRecursive(
 }
 
 Grid FindSystemTrayGrid() {
-    if (!g_taskbarWnd) {
+    HWND taskbarWnd = g_taskbarWnd.load(std::memory_order_acquire);
+    if (!taskbarWnd) {
         return nullptr;
     }
 
-    auto xamlRoot = GetTaskbarXamlRoot(g_taskbarWnd);
+    auto xamlRoot = GetTaskbarXamlRoot(taskbarWnd);
     if (!xamlRoot) {
         return nullptr;
     }
@@ -819,6 +846,7 @@ void EnsureButtonOnTaskbarThread(void*) {
 }
 
 void RemoveButtonOnTaskbarThread(void*) {
+    g_iconLoadedRevokers.clear();
     RemoveButton();
 }
 
@@ -828,24 +856,230 @@ void SyncButtonWithTaskbar() {
         return;
     }
 
-    g_taskbarWnd = hWnd;
+    g_taskbarWnd.store(hWnd, std::memory_order_release);
     if (!RunFromWindowThread(
             hWnd, EnsureButtonOnTaskbarThread, nullptr)) {
         Wh_Log(L"Failed to marshal button update to the taskbar thread");
     }
 }
 
-DWORD WINAPI MonitorThreadProc(void*) {
-    while (!g_unloading) {
-        SyncButtonWithTaskbar();
+ULONG CALLBACK PowerSettingNotificationCallback(PVOID,
+                                                 ULONG type,
+                                                 PVOID setting) {
+    g_activePowerCallbacks.fetch_add(1, std::memory_order_acq_rel);
 
-        DWORD waitResult = WaitForSingleObject(
-            g_monitorStopEvent, kRefreshIntervalMs);
-        if (waitResult != WAIT_TIMEOUT) {
-            break;
+    if (!g_unloading && type == PBT_POWERSETTINGCHANGE && setting) {
+        const auto* powerSetting =
+            static_cast<const POWERBROADCAST_SETTING*>(setting);
+        if (InlineIsEqualGUID(powerSetting->PowerSetting,
+                              kLidCloseAction) ||
+            InlineIsEqualGUID(powerSetting->PowerSetting,
+                              kActivePowerScheme)) {
+            SyncButtonWithTaskbar();
         }
     }
-    return 0;
+
+    g_activePowerCallbacks.fetch_sub(1, std::memory_order_acq_rel);
+    return ERROR_SUCCESS;
+}
+
+bool RegisterPowerNotifications() {
+    DeviceNotifySubscribeParameters parameters{
+        PowerSettingNotificationCallback,
+        nullptr,
+    };
+
+    DWORD error = PowerSettingRegisterNotification(
+        &kLidCloseAction,
+        DEVICE_NOTIFY_CALLBACK,
+        reinterpret_cast<HANDLE>(&parameters),
+        &g_lidCloseNotification);
+    if (error != ERROR_SUCCESS) {
+        Wh_Log(L"Failed to register lid setting notifications: %lu",
+               error);
+        g_lidCloseNotification = nullptr;
+        return false;
+    }
+
+    error = PowerSettingRegisterNotification(
+        &kActivePowerScheme,
+        DEVICE_NOTIFY_CALLBACK,
+        reinterpret_cast<HANDLE>(&parameters),
+        &g_activeSchemeNotification);
+    if (error != ERROR_SUCCESS) {
+        Wh_Log(L"Failed to register power scheme notifications: %lu",
+               error);
+        PowerSettingUnregisterNotification(g_lidCloseNotification);
+        g_lidCloseNotification = nullptr;
+        g_activeSchemeNotification = nullptr;
+        return false;
+    }
+
+    Wh_Log(L"Power setting notifications registered");
+    return true;
+}
+
+void UnregisterPowerNotifications() {
+    HPOWERNOTIFY lidCloseNotification = g_lidCloseNotification;
+    HPOWERNOTIFY activeSchemeNotification =
+        g_activeSchemeNotification;
+    g_lidCloseNotification = nullptr;
+    g_activeSchemeNotification = nullptr;
+
+    if (lidCloseNotification) {
+        DWORD error =
+            PowerSettingUnregisterNotification(lidCloseNotification);
+        if (error != ERROR_SUCCESS) {
+            Wh_Log(L"Failed to unregister lid setting notifications: %lu",
+                   error);
+        }
+    }
+
+    if (activeSchemeNotification) {
+        DWORD error = PowerSettingUnregisterNotification(
+            activeSchemeNotification);
+        if (error != ERROR_SUCCESS) {
+            Wh_Log(
+                L"Failed to unregister power scheme notifications: %lu",
+                error);
+        }
+    }
+
+    while (g_activePowerCallbacks.load(std::memory_order_acquire) != 0) {
+        Sleep(1);
+    }
+}
+
+VS_FIXEDFILEINFO* GetModuleVersionInfo(HMODULE module) {
+    HRSRC resource = FindResourceW(
+        module, MAKEINTRESOURCEW(VS_VERSION_INFO), RT_VERSION);
+    if (!resource) {
+        return nullptr;
+    }
+
+    HGLOBAL resourceData = LoadResource(module, resource);
+    if (!resourceData) {
+        return nullptr;
+    }
+
+    void* data = LockResource(resourceData);
+    if (!data) {
+        return nullptr;
+    }
+
+    VS_FIXEDFILEINFO* versionInfo = nullptr;
+    UINT versionInfoSize = 0;
+    if (!VerQueryValueW(data,
+                        L"\\",
+                        reinterpret_cast<void**>(&versionInfo),
+                        &versionInfoSize) ||
+        versionInfoSize < sizeof(VS_FIXEDFILEINFO)) {
+        return nullptr;
+    }
+    return versionInfo;
+}
+
+HMODULE GetSystemTrayModuleHandle() {
+    HMODULE module = GetModuleHandleW(L"SystemTray.dll");
+    if (module) {
+        return module;
+    }
+
+    module = GetModuleHandleW(L"Taskbar.View.dll");
+    if (module) {
+        VS_FIXEDFILEINFO* versionInfo =
+            GetModuleVersionInfo(module);
+        WORD moduleMajor =
+            versionInfo ? HIWORD(versionInfo->dwFileVersionMS) : 0;
+        if (!moduleMajor || moduleMajor >= 2604) {
+            module = nullptr;
+        }
+    }
+
+    if (!module) {
+        module = GetModuleHandleW(L"ExplorerExtensions.dll");
+    }
+    return module;
+}
+
+using IconView_IconView_t = void*(WINAPI*)(void* pThis);
+IconView_IconView_t IconView_IconView_Original = nullptr;
+
+void* WINAPI IconView_IconView_Hook(void* pThis) {
+    void* result = IconView_IconView_Original(pThis);
+    if (g_unloading) {
+        return result;
+    }
+
+    FrameworkElement iconView{nullptr};
+    reinterpret_cast<IUnknown**>(pThis)[1]->QueryInterface(
+        winrt::guid_of<FrameworkElement>(),
+        winrt::put_abi(iconView));
+    if (!iconView) {
+        SyncButtonWithTaskbar();
+        return result;
+    }
+
+    g_iconLoadedRevokers.emplace_back();
+    auto revokerIterator = std::prev(g_iconLoadedRevokers.end());
+    *revokerIterator = iconView.Loaded(
+        winrt::auto_revoke_t{},
+        [revokerIterator](
+            winrt::Windows::Foundation::IInspectable const&,
+            RoutedEventArgs const&) {
+            g_iconLoadedRevokers.erase(revokerIterator);
+            if (!g_unloading) {
+                SyncButtonWithTaskbar();
+            }
+        });
+
+    return result;
+}
+
+bool HookSystemTraySymbols(HMODULE module) {
+    WindhawkUtils::SYMBOL_HOOK hooks[] = {{
+        {LR"(public: __cdecl winrt::SystemTray::implementation::IconView::IconView(void))"},
+        &IconView_IconView_Original,
+        IconView_IconView_Hook,
+    }};
+
+    return WindhawkUtils::HookSymbols(
+        module, hooks, ARRAYSIZE(hooks));
+}
+
+void HandleLoadedModuleIfSystemTray(HMODULE module) {
+    if (g_unloading || !module ||
+        GetSystemTrayModuleHandle() != module) {
+        return;
+    }
+
+    bool expected = false;
+    if (!g_systemTrayModuleHooked.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    if (HookSystemTraySymbols(module)) {
+        Wh_ApplyHookOperations();
+        Wh_Log(L"System tray reconstruction hook installed");
+    } else {
+        g_systemTrayModuleHooked = false;
+        Wh_Log(L"Failed to hook system tray reconstruction");
+    }
+}
+
+using LoadLibraryExW_t =
+    HMODULE(WINAPI*)(LPCWSTR fileName, HANDLE file, DWORD flags);
+LoadLibraryExW_t LoadLibraryExW_Original = nullptr;
+
+HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName,
+                                   HANDLE file,
+                                   DWORD flags) {
+    HMODULE module = LoadLibraryExW_Original(fileName, file, flags);
+    if (module) {
+        HandleLoadedModuleIfSystemTray(module);
+    }
+    return module;
 }
 
 bool ResolveTaskbarSymbols() {
@@ -879,6 +1113,34 @@ bool ResolveTaskbarSymbols() {
         taskbarModule, hooks, ARRAYSIZE(hooks));
 }
 
+bool PrepareSystemTrayHook() {
+    if (HMODULE systemTrayModule = GetSystemTrayModuleHandle()) {
+        g_systemTrayModuleHooked = true;
+        if (!HookSystemTraySymbols(systemTrayModule)) {
+            g_systemTrayModuleHooked = false;
+            Wh_Log(L"Failed to hook system tray reconstruction");
+            return false;
+        }
+        return true;
+    }
+
+    HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");
+    auto loadLibraryExW = kernelBase
+        ? reinterpret_cast<LoadLibraryExW_t>(
+              GetProcAddress(kernelBase, "LoadLibraryExW"))
+        : nullptr;
+    if (!loadLibraryExW) {
+        Wh_Log(L"Failed to locate LoadLibraryExW");
+        return false;
+    }
+
+    WindhawkUtils::SetFunctionHook(
+        loadLibraryExW,
+        LoadLibraryExW_Hook,
+        &LoadLibraryExW_Original);
+    return true;
+}
+
 }  // namespace
 
 BOOL Wh_ModInit() {
@@ -887,45 +1149,28 @@ BOOL Wh_ModInit() {
         Wh_Log(L"Failed to resolve taskbar symbols");
         return FALSE;
     }
+    if (!PrepareSystemTrayHook()) {
+        return FALSE;
+    }
+    if (!RegisterPowerNotifications()) {
+        return FALSE;
+    }
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
-    g_monitorStopEvent =
-        CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_monitorStopEvent) {
-        Wh_Log(L"Failed to create the monitor stop event: %lu",
-               GetLastError());
-        SyncButtonWithTaskbar();
-        return;
+    if (!g_systemTrayModuleHooked) {
+        HandleLoadedModuleIfSystemTray(
+            GetSystemTrayModuleHandle());
     }
-
-    g_monitorThread =
-        CreateThread(nullptr, 0, MonitorThreadProc, nullptr, 0, nullptr);
-    if (!g_monitorThread) {
-        Wh_Log(L"Failed to create the monitor thread: %lu",
-               GetLastError());
-        SyncButtonWithTaskbar();
-    }
+    SyncButtonWithTaskbar();
 }
 
 void Wh_ModUninit() {
     g_unloading = true;
+    UnregisterPowerNotifications();
 
-    if (g_monitorStopEvent) {
-        SetEvent(g_monitorStopEvent);
-    }
-    if (g_monitorThread) {
-        WaitForSingleObject(g_monitorThread, INFINITE);
-        CloseHandle(g_monitorThread);
-        g_monitorThread = nullptr;
-    }
-    if (g_monitorStopEvent) {
-        CloseHandle(g_monitorStopEvent);
-        g_monitorStopEvent = nullptr;
-    }
-
-    HWND hWnd = g_taskbarWnd;
+    HWND hWnd = g_taskbarWnd.load(std::memory_order_acquire);
     if (!hWnd || !IsWindow(hWnd)) {
         hWnd = FindCurrentProcessTaskbarWnd();
     }
@@ -933,6 +1178,7 @@ void Wh_ModUninit() {
         RunFromWindowThread(
             hWnd, RemoveButtonOnTaskbarThread, nullptr);
     } else {
+        g_iconLoadedRevokers.clear();
         ReleaseButtonReferences();
     }
 
