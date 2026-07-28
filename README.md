@@ -60,18 +60,3 @@ The mod doesn't poll. It subscribes to Windows notifications for the lid
 action, active power plan, and AC/DC power source. It also listens for
 system-tray XAML reconstruction events so the button is restored when Explorer
 rebuilds the Windows 11 taskbar.
-
-## Icon preview mod
-
-[`lid-closing-icons-test.wh.cpp`](lid-closing-icons-test.wh.cpp) is a separate
-development mod for comparing five icon sets in the real taskbar layout. Its
-buttons only cycle local preview states and never read or change power
-settings.
-
-The preview buttons, from left to right:
-
-1. Standard QuietHours / Blocked / PowerButton glyphs
-2. QuietHours with a diagonal strike-through
-3. QuietHours with a small Blocked2 badge
-4. ActionCenterQuiet / Blocked2 system glyphs
-5. MobQuietHours / a custom circle-minus composition
