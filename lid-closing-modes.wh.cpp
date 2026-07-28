@@ -2,7 +2,7 @@
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
 // @description     Adds a taskbar button that switches lid closing between sleep and do nothing
-// @version         1.6.0
+// @version         1.6.1
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
@@ -452,7 +452,7 @@ std::wstring FormatError(DWORD error) {
             FORMAT_MESSAGE_IGNORE_INSERTS,
         nullptr,
         error,
-        0,
+        MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US),
         reinterpret_cast<wchar_t*>(&message),
         0,
         nullptr);
@@ -836,15 +836,13 @@ DWORD WriteLinkedLidMode(DWORD value) {
 std::wstring PowerValueName(DWORD value) {
     switch (value) {
         case 0:
-            return L"\u043d\u0438\u0447\u0435\u0433\u043e "
-                   L"\u043d\u0435 \u0434\u0435\u043b\u0430\u0442\u044c";
+            return L"Do nothing";
         case 1:
-            return L"\u0441\u043e\u043d";
+            return L"Sleep";
         case 2:
-            return L"\u0433\u0438\u0431\u0435\u0440\u043d\u0430\u0446\u0438\u044f";
+            return L"Hibernate";
         case 3:
-            return L"\u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0438\u0435 "
-                   L"\u0440\u0430\u0431\u043e\u0442\u044b";
+            return L"Shut down";
         default: {
             wchar_t buffer[32];
             swprintf_s(buffer, L"%lu", value);
@@ -855,23 +853,17 @@ std::wstring PowerValueName(DWORD value) {
 
 std::wstring PowerSourceName(PowerSource source) {
     if (source == PowerSource::PluggedIn) {
-        return L"\u041f\u0438\u0442\u0430\u043d\u0438\u0435: "
-               L"\u043e\u0442 \u0441\u0435\u0442\u0438";
+        return L"Power source: Plugged in";
     }
     if (source == PowerSource::OnBattery) {
-        return L"\u041f\u0438\u0442\u0430\u043d\u0438\u0435: "
-               L"\u043e\u0442 \u0431\u0430\u0442\u0430\u0440\u0435\u0438";
+        return L"Power source: On battery";
     }
-    return L"\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a "
-           L"\u043f\u0438\u0442\u0430\u043d\u0438\u044f "
-           L"\u043d\u0435 \u043e\u043f\u0440\u0435\u0434\u0435\u043b\u0451\u043d";
+    return L"Power source: Unknown";
 }
 
 std::wstring PowerScopeName(LidSetting const& setting) {
     if (!setting.separatePowerSources) {
-        return L"\u041f\u0438\u0442\u0430\u043d\u0438\u0435: "
-               L"\u043e\u0442 \u0441\u0435\u0442\u0438 \u0438 "
-               L"\u043e\u0442 \u0431\u0430\u0442\u0430\u0440\u0435\u0438";
+        return L"Power source: Plugged in and on battery";
     }
     return PowerSourceName(setting.source);
 }
@@ -1060,82 +1052,53 @@ void UpdateButtonVisual() {
         GetTickCount64() < g_lastOperationErrorExpiresAt;
     if (showOperationError) {
         glyph = L"!";
-        accessibleName =
-            L"\u041e\u0448\u0438\u0431\u043a\u0430 "
-            L"\u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f "
-            L"\u0440\u0435\u0436\u0438\u043c\u0430 \u043a\u0440\u044b\u0448\u043a\u0438";
+        accessibleName = L"Failed to change the lid close action";
         tooltip =
-            L"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c "
-            L"\u0438\u0437\u043c\u0435\u043d\u0438\u0442\u044c "
-            L"\u0440\u0435\u0436\u0438\u043c:\n" +
+            accessibleName + L":\n" +
             FormatError(g_lastOperationError);
     } else if (setting.mode == LidMode::Sleep) {
         glyph = L"\xE708";
-        accessibleName =
-            L"\u0417\u0430\u043a\u0440\u044b\u0442\u0438\u0435 "
-            L"\u043a\u0440\u044b\u0448\u043a\u0438: \u0441\u043e\u043d";
+        accessibleName = L"Lid close action: Sleep";
         tooltip =
             accessibleName +
             L"\n" + PowerScopeName(setting) +
-            L"\n\u041d\u0430\u0436\u043c\u0438\u0442\u0435: "
-            L"\u043d\u0438\u0447\u0435\u0433\u043e "
-            L"\u043d\u0435 \u0434\u0435\u043b\u0430\u0442\u044c";
+            L"\nClick to switch to Do nothing";
     } else if (setting.mode == LidMode::DoNothing) {
         glyph = L"\xE733";
-        accessibleName =
-            L"\u0417\u0430\u043a\u0440\u044b\u0442\u0438\u0435 "
-            L"\u043a\u0440\u044b\u0448\u043a\u0438: "
-            L"\u043d\u0438\u0447\u0435\u0433\u043e "
-            L"\u043d\u0435 \u0434\u0435\u043b\u0430\u0442\u044c";
+        accessibleName = L"Lid close action: Do nothing";
         tooltip =
             accessibleName +
             L"\n" + PowerScopeName(setting) +
-            L"\n\u041d\u0430\u0436\u043c\u0438\u0442\u0435: "
-            L"\u0441\u043e\u043d";
+            L"\nClick to switch to Sleep";
     } else if (setting.mode == LidMode::Other) {
         glyph = L"?";
         if (!setting.separatePowerSources) {
             if (setting.acValue != setting.dcValue) {
-                accessibleName =
-                    L"\u0420\u0435\u0436\u0438\u043c\u044b "
-                    L"\u0437\u0430\u043a\u0440\u044b\u0442\u0438\u044f "
-                    L"\u043a\u0440\u044b\u0448\u043a\u0438 "
-                    L"\u0440\u0430\u0437\u043b\u0438\u0447\u0430\u044e\u0442\u0441\u044f";
+                accessibleName = L"Lid close actions differ";
             } else {
                 accessibleName =
-                    L"\u0417\u0430\u043a\u0440\u044b\u0442\u0438\u0435 "
-                    L"\u043a\u0440\u044b\u0448\u043a\u0438: " +
+                    L"Lid close action: " +
                     PowerValueName(setting.acValue);
             }
             tooltip =
                 accessibleName +
-                L"\n\u041e\u0442 \u0441\u0435\u0442\u0438: " +
+                L"\nPlugged in: " +
                 PowerValueName(setting.acValue) +
-                L"\n\u041e\u0442 \u0431\u0430\u0442\u0430\u0440\u0435\u0438: " +
+                L"\nOn battery: " +
                 PowerValueName(setting.dcValue) +
-                L"\n\u041d\u0430\u0436\u043c\u0438\u0442\u0435: "
-                L"\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c "
-                L"\u0441\u043e\u043d \u0434\u043b\u044f "
-                L"\u043e\u0431\u043e\u0438\u0445 \u0440\u0435\u0436\u0438\u043c\u043e\u0432";
+                L"\nClick to set both to Sleep";
         } else {
             accessibleName =
-                L"\u0417\u0430\u043a\u0440\u044b\u0442\u0438\u0435 "
-                L"\u043a\u0440\u044b\u0448\u043a\u0438: " +
+                L"Lid close action: " +
                 PowerValueName(setting.activeValue);
             tooltip =
                 accessibleName +
                 L"\n" + PowerScopeName(setting) +
-                L"\n\u041d\u0430\u0436\u043c\u0438\u0442\u0435: "
-                L"\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c "
-                L"\u0441\u043e\u043d";
+                L"\nClick to switch to Sleep";
         }
     } else {
         glyph = L"!";
-        accessibleName =
-            L"\u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0430 "
-            L"\u0437\u0430\u043a\u0440\u044b\u0442\u0438\u044f "
-            L"\u043a\u0440\u044b\u0448\u043a\u0438 "
-            L"\u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430";
+        accessibleName = L"Lid close action is unavailable";
         tooltip =
             accessibleName +
             L"\n" + FormatError(setting.error);
