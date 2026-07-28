@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
-// @description     Adds a taskbar button that switches lid closing between sleep and do nothing
-// @version         1.6.1
+// @description     Adds a taskbar button that cycles through selected lid-close actions
+// @version         1.7.0
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
@@ -15,10 +15,12 @@
 # Lid Closing Mode Button
 
 Adds a compact button immediately to the left of the Windows 11 system tray.
-The button switches the **When I close the lid** action between:
+The button cycles the **When I close the lid** action through the actions
+enabled in the mod settings:
 
 - Sleep
 - Do nothing
+- Shut down (disabled by default)
 
 The button follows the current power source. While plugged in, it displays and
 changes only the **Plugged in** value. On battery, it displays and changes only
@@ -33,9 +35,9 @@ The button mirrors the native Windows 11 system tray button geometry and
 visual states, including its hover border, pressed state, transition timing,
 and light, dark, and high contrast colors.
 
-The moon icon means **Sleep**. The blocked icon means **Do nothing**. Other
-lid actions show a question mark, and the next click sets the current power
-source's value to **Sleep**.
+The moon icon means **Sleep**, the blocked icon means **Do nothing**, and the
+power icon means **Shut down**. Other lid actions show a question mark, and the
+next click selects the first enabled action in the cycle.
 
 This mod targets the Windows 11 XAML taskbar.
 */
@@ -49,6 +51,15 @@ This mod targets the Windows 11 XAML taskbar.
     When enabled, the button displays and changes only the current power
     source's lid action. When disabled, the button displays and changes the
     plugged-in and battery actions together.
+- cycleSleep: true
+  $name: Include Sleep in the cycle
+  $description: Include Sleep when cycling through lid close actions.
+- cycleDoNothing: true
+  $name: Include Do nothing in the cycle
+  $description: Include Do nothing when cycling through lid close actions.
+- cycleShutDown: false
+  $name: Include Shut down in the cycle
+  $description: Include Shut down when cycling through lid close actions.
 */
 // ==/WindhawkModSettings==
 
@@ -91,6 +102,7 @@ namespace {
 constexpr wchar_t kRootName[] = L"LidClosingModes_Root";
 constexpr DWORD kDoNothingValue = 0;
 constexpr DWORD kSleepValue = 1;
+constexpr DWORD kShutDownValue = 3;
 
 void DebugLog(std::wstring const& message) {
     std::wstring line =
@@ -151,6 +163,7 @@ enum class PowerSource {
 enum class LidMode {
     DoNothing,
     Sleep,
+    ShutDown,
     Other,
     Unavailable,
 };
@@ -173,6 +186,9 @@ struct PowerSchemeLidValues {
 
 std::atomic<bool> g_unloading{false};
 std::atomic<bool> g_separatePowerSources{true};
+std::atomic<bool> g_cycleSleep{true};
+std::atomic<bool> g_cycleDoNothing{true};
+std::atomic<bool> g_cycleShutDown{false};
 std::atomic<HWND> g_taskbarWnd{nullptr};
 HPOWERNOTIFY g_lidCloseNotification = nullptr;
 HPOWERNOTIFY g_activeSchemeNotification = nullptr;
@@ -227,6 +243,15 @@ void SyncButtonWithTaskbar();
 void LoadSettings() {
     g_separatePowerSources.store(
         Wh_GetIntSetting(L"separatePowerSources") != 0,
+        std::memory_order_release);
+    g_cycleSleep.store(
+        Wh_GetIntSetting(L"cycleSleep") != 0,
+        std::memory_order_release);
+    g_cycleDoNothing.store(
+        Wh_GetIntSetting(L"cycleDoNothing") != 0,
+        std::memory_order_release);
+    g_cycleShutDown.store(
+        Wh_GetIntSetting(L"cycleShutDown") != 0,
         std::memory_order_release);
 }
 
@@ -575,6 +600,8 @@ LidSetting ReadLidSetting() {
         result.mode = LidMode::Sleep;
     } else if (result.activeValue == kDoNothingValue) {
         result.mode = LidMode::DoNothing;
+    } else if (result.activeValue == kShutDownValue) {
+        result.mode = LidMode::ShutDown;
     } else {
         result.mode = LidMode::Other;
     }
@@ -851,6 +878,70 @@ std::wstring PowerValueName(DWORD value) {
     }
 }
 
+bool IsCycleValueEnabled(DWORD value) {
+    if (value == kSleepValue) {
+        return g_cycleSleep.load(std::memory_order_acquire);
+    }
+    if (value == kDoNothingValue) {
+        return g_cycleDoNothing.load(std::memory_order_acquire);
+    }
+    if (value == kShutDownValue) {
+        return g_cycleShutDown.load(std::memory_order_acquire);
+    }
+    return false;
+}
+
+bool GetNextCycleValue(DWORD currentValue, DWORD* nextValue) {
+    constexpr DWORD values[] = {
+        kSleepValue,
+        kDoNothingValue,
+        kShutDownValue,
+    };
+
+    size_t startIndex = 0;
+    for (size_t i = 0; i < ARRAYSIZE(values); i++) {
+        if (values[i] == currentValue) {
+            startIndex = i + 1;
+            break;
+        }
+    }
+
+    for (size_t offset = 0; offset < ARRAYSIZE(values); offset++) {
+        DWORD candidate =
+            values[(startIndex + offset) % ARRAYSIZE(values)];
+        if (candidate != currentValue &&
+            IsCycleValueEnabled(candidate)) {
+            if (nextValue) {
+                *nextValue = candidate;
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
+DWORD CurrentCycleValue(LidSetting const& setting) {
+    if (!setting.separatePowerSources &&
+        setting.acValue != setting.dcValue) {
+        return MAXDWORD;
+    }
+    return setting.activeValue;
+}
+
+std::wstring CycleInstruction(DWORD currentValue, bool setBoth) {
+    DWORD nextValue = 0;
+    if (!GetNextCycleValue(currentValue, &nextValue)) {
+        return L"No other actions are enabled in the cycle";
+    }
+
+    return setBoth
+               ? L"Click to set both to " +
+                     PowerValueName(nextValue)
+               : L"Click to switch to " +
+                     PowerValueName(nextValue);
+}
+
 std::wstring PowerSourceName(PowerSource source) {
     if (source == PowerSource::PluggedIn) {
         return L"Power source: Plugged in";
@@ -1043,6 +1134,7 @@ void UpdateButtonVisual() {
     }
 
     LidSetting setting = ReadLidSetting();
+    DWORD currentCycleValue = CurrentCycleValue(setting);
     std::wstring glyph;
     std::wstring accessibleName;
     std::wstring tooltip;
@@ -1062,14 +1154,24 @@ void UpdateButtonVisual() {
         tooltip =
             accessibleName +
             L"\n" + PowerScopeName(setting) +
-            L"\nClick to switch to Do nothing";
+            L"\n" + CycleInstruction(
+                currentCycleValue, !setting.separatePowerSources);
     } else if (setting.mode == LidMode::DoNothing) {
         glyph = L"\xE733";
         accessibleName = L"Lid close action: Do nothing";
         tooltip =
             accessibleName +
             L"\n" + PowerScopeName(setting) +
-            L"\nClick to switch to Sleep";
+            L"\n" + CycleInstruction(
+                currentCycleValue, !setting.separatePowerSources);
+    } else if (setting.mode == LidMode::ShutDown) {
+        glyph = L"\xE7E8";
+        accessibleName = L"Lid close action: Shut down";
+        tooltip =
+            accessibleName +
+            L"\n" + PowerScopeName(setting) +
+            L"\n" + CycleInstruction(
+                currentCycleValue, !setting.separatePowerSources);
     } else if (setting.mode == LidMode::Other) {
         glyph = L"?";
         if (!setting.separatePowerSources) {
@@ -1086,7 +1188,7 @@ void UpdateButtonVisual() {
                 PowerValueName(setting.acValue) +
                 L"\nOn battery: " +
                 PowerValueName(setting.dcValue) +
-                L"\nClick to set both to Sleep";
+                L"\n" + CycleInstruction(currentCycleValue, true);
         } else {
             accessibleName =
                 L"Lid close action: " +
@@ -1094,7 +1196,7 @@ void UpdateButtonVisual() {
             tooltip =
                 accessibleName +
                 L"\n" + PowerScopeName(setting) +
-                L"\nClick to switch to Sleep";
+                L"\n" + CycleInstruction(currentCycleValue, false);
         }
     } else {
         glyph = L"!";
@@ -1114,17 +1216,22 @@ void UpdateButtonVisual() {
 
 void OnButtonClick() {
     LidSetting current = ReadLidSetting();
-    DWORD target = current.mode == LidMode::Sleep
-                       ? kDoNothingValue
-                       : kSleepValue;
     DWORD error = current.error;
-    if (error == ERROR_SUCCESS) {
+    DWORD target = 0;
+    bool hasNextValue =
+        error == ERROR_SUCCESS &&
+        GetNextCycleValue(CurrentCycleValue(current), &target);
+    if (error == ERROR_SUCCESS && hasNextValue) {
         error = current.separatePowerSources
                     ? WriteLidMode(current.source, target)
                     : WriteLinkedLidMode(target);
     }
 
-    if (error == ERROR_RETRY) {
+    if (error == ERROR_SUCCESS && !hasNextValue) {
+        g_lastOperationError = ERROR_SUCCESS;
+        g_lastOperationErrorExpiresAt = 0;
+        Wh_Log(L"No other lid actions are enabled in the cycle");
+    } else if (error == ERROR_RETRY) {
         g_lastOperationError = ERROR_SUCCESS;
         g_lastOperationErrorExpiresAt = 0;
         Wh_Log(L"Power source changed during click; no value was changed");
@@ -1134,12 +1241,12 @@ void OnButtonClick() {
         if (current.separatePowerSources) {
             Wh_Log(L"Lid close action changed to %ls for %ls "
                    L"across all power plans",
-                   target == kSleepValue ? L"sleep" : L"do nothing",
+                   PowerValueName(target).c_str(),
                    current.source == PowerSource::PluggedIn ? L"AC" : L"DC");
         } else {
             Wh_Log(L"Lid close action changed to %ls for AC and DC "
                    L"across all power plans",
-                   target == kSleepValue ? L"sleep" : L"do nothing");
+                   PowerValueName(target).c_str());
         }
     } else {
         g_lastOperationError = error;

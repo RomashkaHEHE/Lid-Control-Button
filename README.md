@@ -3,10 +3,12 @@
 A Windhawk mod for Windows 11 that adds one button immediately to the left of
 the system tray.
 
-The button toggles the lid-close action between:
+The button cycles the lid-close action through the actions enabled in the mod
+settings:
 
 - Sleep
 - Do nothing
+- Shut down (disabled by default)
 
 It follows the current power source:
 
@@ -14,7 +16,8 @@ It follows the current power source:
 - On battery, it displays and changes only the battery (DC) value.
 
 Connecting or disconnecting the charger updates the button immediately. A moon
-icon means Sleep, and a blocked icon means Do nothing.
+icon means Sleep, a blocked icon means Do nothing, and a power icon means Shut
+down.
 
 Changes are written to every power plan, matching the global lid settings shown
 by `powercfg.cpl`. The active plan is then reapplied so the new behavior takes
@@ -33,8 +36,17 @@ colors are matched for light, dark, and high contrast modes.
 - Disabled: the button reads and changes AC and DC together.
 
 If AC and DC already differ when linked mode is selected, the button shows a
-question mark without changing either value. The next click explicitly sets
-both to Sleep.
+question mark without changing either value. The next click sets both to the
+first enabled action in the cycle.
+
+The cycle has one toggle for each supported action:
+
+- **Include Sleep in the cycle**: enabled by default.
+- **Include Do nothing in the cycle**: enabled by default.
+- **Include Shut down in the cycle**: disabled by default.
+
+If the current action is not enabled, the next click selects the first enabled
+action. If no other action is enabled, clicking the button does nothing.
 
 ## Install
 
@@ -48,3 +60,18 @@ The mod doesn't poll. It subscribes to Windows notifications for the lid
 action, active power plan, and AC/DC power source. It also listens for
 system-tray XAML reconstruction events so the button is restored when Explorer
 rebuilds the Windows 11 taskbar.
+
+## Icon preview mod
+
+[`lid-closing-icons-test.wh.cpp`](lid-closing-icons-test.wh.cpp) is a separate
+development mod for comparing five icon sets in the real taskbar layout. Its
+buttons only cycle local preview states and never read or change power
+settings.
+
+The preview buttons, from left to right:
+
+1. Standard QuietHours / Blocked / PowerButton glyphs
+2. QuietHours with a diagonal strike-through
+3. QuietHours with a small Blocked2 badge
+4. ActionCenterQuiet / Blocked2 system glyphs
+5. MobQuietHours / a custom circle-minus composition
