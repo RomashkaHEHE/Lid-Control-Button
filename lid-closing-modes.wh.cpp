@@ -2,7 +2,7 @@
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
 // @description     Adds a taskbar button that switches lid closing between sleep and do nothing
-// @version         1.5.1
+// @version         1.5.2
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
@@ -90,6 +90,12 @@ constexpr wchar_t kRootName[] = L"LidClosingModes_Root";
 constexpr DWORD kDoNothingValue = 0;
 constexpr DWORD kSleepValue = 1;
 
+void DebugLog(std::wstring const& message) {
+    std::wstring line =
+        L"[LidClosingModes] " + message + L"\n";
+    OutputDebugStringW(line.c_str());
+}
+
 #ifndef DEVICE_NOTIFY_CALLBACK
 #define DEVICE_NOTIFY_CALLBACK 2
 #endif
@@ -168,21 +174,17 @@ std::atomic<bool> g_systemTrayModuleHooked{false};
 
 Grid g_injectionRoot{nullptr};
 Grid g_injectionParent{nullptr};
-Button g_button{nullptr};
+Grid g_button{nullptr};
 Border g_buttonBackground{nullptr};
 FontIcon g_icon{nullptr};
-winrt::event_token g_clickToken{};
+winrt::event_token g_tappedToken{};
 winrt::event_token g_pointerEnteredToken{};
 winrt::event_token g_pointerExitedToken{};
+winrt::event_token g_pointerPressedToken{};
+winrt::event_token g_pointerReleasedToken{};
+winrt::event_token g_pointerCanceledToken{};
+winrt::event_token g_pointerCaptureLostToken{};
 winrt::event_token g_actualThemeChangedToken{};
-winrt::Windows::Foundation::IInspectable
-    g_pointerPressedHandler{nullptr};
-winrt::Windows::Foundation::IInspectable
-    g_pointerReleasedHandler{nullptr};
-winrt::Windows::Foundation::IInspectable
-    g_pointerCanceledHandler{nullptr};
-winrt::Windows::Foundation::IInspectable
-    g_pointerCaptureLostHandler{nullptr};
 std::list<FrameworkElement::Loaded_revoker> g_iconLoadedRevokers;
 
 SolidColorBrush g_buttonNormalBackgroundBrush{nullptr};
@@ -295,18 +297,21 @@ XamlRoot GetTaskbarXamlRoot(HWND hTaskbarWnd) {
         !TaskbarHost_FrameHeight_Original ||
         !std__Ref_count_base__Decref_Original ||
         !CTaskBand_ITaskListWndSite_vftable) {
+        DebugLog(L"GetTaskbarXamlRoot: taskbar symbols are unavailable");
         return nullptr;
     }
 
     HWND hTaskSwWnd =
         reinterpret_cast<HWND>(GetPropW(hTaskbarWnd, L"TaskbandHWND"));
     if (!hTaskSwWnd) {
+        DebugLog(L"GetTaskbarXamlRoot: TaskbandHWND is unavailable");
         return nullptr;
     }
 
     void* taskBand =
         reinterpret_cast<void*>(GetWindowLongPtrW(hTaskSwWnd, 0));
     if (!taskBand) {
+        DebugLog(L"GetTaskbarXamlRoot: CTaskBand is unavailable");
         return nullptr;
     }
 
@@ -316,6 +321,8 @@ XamlRoot GetTaskbarXamlRoot(HWND hTaskbarWnd) {
          CTaskBand_ITaskListWndSite_vftable;
          i++) {
         if (i == 20) {
+            DebugLog(
+                L"GetTaskbarXamlRoot: ITaskListWndSite was not found");
             return nullptr;
         }
         taskBandForSite =
@@ -326,6 +333,7 @@ XamlRoot GetTaskbarXamlRoot(HWND hTaskbarWnd) {
     CTaskBand_GetTaskbarHost_Original(taskBandForSite,
                                       taskbarHostSharedPtr);
     if (!taskbarHostSharedPtr[0] || !taskbarHostSharedPtr[1]) {
+        DebugLog(L"GetTaskbarXamlRoot: TaskbarHost is unavailable");
         if (taskbarHostSharedPtr[1]) {
             std__Ref_count_base__Decref_Original(
                 taskbarHostSharedPtr[1]);
@@ -349,6 +357,7 @@ XamlRoot GetTaskbarXamlRoot(HWND hTaskbarWnd) {
         reinterpret_cast<BYTE*>(taskbarHostSharedPtr[0]) +
         taskbarElementOffset);
     if (!taskbarElementUnknown) {
+        DebugLog(L"GetTaskbarXamlRoot: taskbar element is unavailable");
         std__Ref_count_base__Decref_Original(taskbarHostSharedPtr[1]);
         return nullptr;
     }
@@ -360,6 +369,9 @@ XamlRoot GetTaskbarXamlRoot(HWND hTaskbarWnd) {
     XamlRoot result =
         taskbarElement ? taskbarElement.XamlRoot() : nullptr;
     std__Ref_count_base__Decref_Original(taskbarHostSharedPtr[1]);
+    if (!result) {
+        DebugLog(L"GetTaskbarXamlRoot: XamlRoot is unavailable");
+    }
     return result;
 }
 
@@ -396,6 +408,7 @@ FrameworkElement FindChildRecursive(
 Grid FindSystemTrayGrid() {
     HWND taskbarWnd = g_taskbarWnd.load(std::memory_order_acquire);
     if (!taskbarWnd) {
+        DebugLog(L"FindSystemTrayGrid: taskbar window is unavailable");
         return nullptr;
     }
 
@@ -406,15 +419,22 @@ Grid FindSystemTrayGrid() {
 
     auto content = xamlRoot.Content().try_as<FrameworkElement>();
     if (!content) {
+        DebugLog(L"FindSystemTrayGrid: XamlRoot content is unavailable");
         return nullptr;
     }
 
-    return FindChildRecursive(
-               content,
-               [](FrameworkElement const& element) {
-                   return element.Name() == L"SystemTrayFrameGrid";
-               })
-        .try_as<Grid>();
+    auto result = FindChildRecursive(
+                      content,
+                      [](FrameworkElement const& element) {
+                          return element.Name() ==
+                                 L"SystemTrayFrameGrid";
+                      })
+                      .try_as<Grid>();
+    if (!result) {
+        DebugLog(
+            L"FindSystemTrayGrid: SystemTrayFrameGrid was not found");
+    }
+    return result;
 }
 
 std::wstring FormatError(DWORD error) {
@@ -892,19 +912,11 @@ void UpdateButtonThemeColors() {
     UpdateButtonInteractionVisual();
 }
 
-winrt::Windows::Foundation::IInspectable
-InspectablePointerHandler(wuxi::PointerEventHandler handler) {
-    // XAML projects AddHandler's delegate parameter as IInspectable,
-    // while WinRT delegate objects expose IUnknown at the ABI boundary.
-    return {
-        winrt::detach_abi(handler),
-        winrt::take_ownership_from_abi,
-    };
-}
-
-void ApplyTaskbarButtonStyle(Button const& button) {
+void ApplyTaskbarButtonStyle(Grid const& button) {
+    SolidColorBrush hitTestBrush;
+    hitTestBrush.Color({0x00, 0xFF, 0xFF, 0xFF});
+    button.Background(hitTestBrush);
     button.MinWidth(32);
-    button.Opacity(0);
     button.VerticalAlignment(VerticalAlignment::Stretch);
     button.HorizontalAlignment(HorizontalAlignment::Stretch);
 
@@ -1062,8 +1074,8 @@ void OnButtonClick() {
 void ReleaseButtonReferences() {
     if (g_button) {
         try {
-            if (g_clickToken.value) {
-                g_button.Click(g_clickToken);
+            if (g_tappedToken.value) {
+                g_button.Tapped(g_tappedToken);
             }
             if (g_pointerEnteredToken.value) {
                 g_button.PointerEntered(g_pointerEnteredToken);
@@ -1071,25 +1083,18 @@ void ReleaseButtonReferences() {
             if (g_pointerExitedToken.value) {
                 g_button.PointerExited(g_pointerExitedToken);
             }
-            if (g_pointerPressedHandler) {
-                g_button.RemoveHandler(
-                    UIElement::PointerPressedEvent(),
-                    g_pointerPressedHandler);
+            if (g_pointerPressedToken.value) {
+                g_button.PointerPressed(g_pointerPressedToken);
             }
-            if (g_pointerReleasedHandler) {
-                g_button.RemoveHandler(
-                    UIElement::PointerReleasedEvent(),
-                    g_pointerReleasedHandler);
+            if (g_pointerReleasedToken.value) {
+                g_button.PointerReleased(g_pointerReleasedToken);
             }
-            if (g_pointerCanceledHandler) {
-                g_button.RemoveHandler(
-                    UIElement::PointerCanceledEvent(),
-                    g_pointerCanceledHandler);
+            if (g_pointerCanceledToken.value) {
+                g_button.PointerCanceled(g_pointerCanceledToken);
             }
-            if (g_pointerCaptureLostHandler) {
-                g_button.RemoveHandler(
-                    UIElement::PointerCaptureLostEvent(),
-                    g_pointerCaptureLostHandler);
+            if (g_pointerCaptureLostToken.value) {
+                g_button.PointerCaptureLost(
+                    g_pointerCaptureLostToken);
             }
             if (g_actualThemeChangedToken.value) {
                 g_button.ActualThemeChanged(
@@ -1099,14 +1104,14 @@ void ReleaseButtonReferences() {
         }
     }
 
-    g_clickToken = {};
+    g_tappedToken = {};
     g_pointerEnteredToken = {};
     g_pointerExitedToken = {};
+    g_pointerPressedToken = {};
+    g_pointerReleasedToken = {};
+    g_pointerCanceledToken = {};
+    g_pointerCaptureLostToken = {};
     g_actualThemeChangedToken = {};
-    g_pointerPressedHandler = nullptr;
-    g_pointerReleasedHandler = nullptr;
-    g_pointerCanceledHandler = nullptr;
-    g_pointerCaptureLostHandler = nullptr;
     g_buttonPointerOver = false;
     g_buttonPointerPressed = false;
     g_buttonNormalBackgroundBrush = nullptr;
@@ -1200,9 +1205,6 @@ Grid BuildButtonRoot() {
         winrt::Windows::Foundation::TimeSpan{830000});
     background.BackgroundTransition(transition);
 
-    Button button;
-    button.IsTabStop(false);
-
     FontIcon icon;
     icon.FontFamily(
         winrt::Windows::UI::Xaml::Media::FontFamily(
@@ -1211,19 +1213,19 @@ Grid BuildButtonRoot() {
     icon.HorizontalAlignment(HorizontalAlignment::Center);
     icon.VerticalAlignment(VerticalAlignment::Center);
 
-    g_button = button;
+    g_button = root;
     g_buttonBackground = background;
     g_icon = icon;
-    ApplyTaskbarButtonStyle(button);
+    ApplyTaskbarButtonStyle(root);
 
-    g_clickToken = button.Click(
+    g_tappedToken = root.Tapped(
         [](winrt::Windows::Foundation::IInspectable const&,
-           RoutedEventArgs const&) {
+           wuxi::TappedRoutedEventArgs const&) {
             if (!g_unloading) {
                 OnButtonClick();
             }
         });
-    g_pointerEnteredToken = button.PointerEntered(
+    g_pointerEnteredToken = root.PointerEntered(
         [](winrt::Windows::Foundation::IInspectable const&,
            wuxi::PointerRoutedEventArgs const&) {
             if (!g_unloading) {
@@ -1232,7 +1234,7 @@ Grid BuildButtonRoot() {
                 UpdateButtonVisual();
             }
         });
-    g_pointerExitedToken = button.PointerExited(
+    g_pointerExitedToken = root.PointerExited(
         [](winrt::Windows::Foundation::IInspectable const&,
            wuxi::PointerRoutedEventArgs const&) {
             if (!g_unloading) {
@@ -1241,65 +1243,42 @@ Grid BuildButtonRoot() {
                 UpdateButtonInteractionVisual();
             }
         });
-    g_pointerPressedHandler = InspectablePointerHandler(
-        wuxi::PointerEventHandler(
-            [](winrt::Windows::Foundation::IInspectable const&,
-               wuxi::PointerRoutedEventArgs const& args) {
-                if (!g_unloading &&
-                    args.GetCurrentPoint(g_button)
-                        .Properties()
-                        .IsLeftButtonPressed()) {
-                    g_buttonPointerPressed = true;
-                    UpdateButtonInteractionVisual();
-                }
-            }));
-    button.AddHandler(
-        UIElement::PointerPressedEvent(),
-        g_pointerPressedHandler,
-        true);
-
-    g_pointerReleasedHandler = InspectablePointerHandler(
-        wuxi::PointerEventHandler(
-            [](winrt::Windows::Foundation::IInspectable const&,
-               wuxi::PointerRoutedEventArgs const&) {
-                if (!g_unloading) {
-                    g_buttonPointerPressed = false;
-                    UpdateButtonInteractionVisual();
-                }
-            }));
-    button.AddHandler(
-        UIElement::PointerReleasedEvent(),
-        g_pointerReleasedHandler,
-        true);
-
-    g_pointerCanceledHandler = InspectablePointerHandler(
-        wuxi::PointerEventHandler(
-            [](winrt::Windows::Foundation::IInspectable const&,
-               wuxi::PointerRoutedEventArgs const&) {
-                if (!g_unloading) {
-                    g_buttonPointerPressed = false;
-                    UpdateButtonInteractionVisual();
-                }
-            }));
-    button.AddHandler(
-        UIElement::PointerCanceledEvent(),
-        g_pointerCanceledHandler,
-        true);
-
-    g_pointerCaptureLostHandler = InspectablePointerHandler(
-        wuxi::PointerEventHandler(
-            [](winrt::Windows::Foundation::IInspectable const&,
-               wuxi::PointerRoutedEventArgs const&) {
-                if (!g_unloading) {
-                    g_buttonPointerPressed = false;
-                    UpdateButtonInteractionVisual();
-                }
-            }));
-    button.AddHandler(
-        UIElement::PointerCaptureLostEvent(),
-        g_pointerCaptureLostHandler,
-        true);
-    g_actualThemeChangedToken = button.ActualThemeChanged(
+    g_pointerPressedToken = root.PointerPressed(
+        [](winrt::Windows::Foundation::IInspectable const&,
+           wuxi::PointerRoutedEventArgs const& args) {
+            if (!g_unloading &&
+                args.GetCurrentPoint(g_button)
+                    .Properties()
+                    .IsLeftButtonPressed()) {
+                g_buttonPointerPressed = true;
+                UpdateButtonInteractionVisual();
+            }
+        });
+    g_pointerReleasedToken = root.PointerReleased(
+        [](winrt::Windows::Foundation::IInspectable const&,
+           wuxi::PointerRoutedEventArgs const&) {
+            if (!g_unloading) {
+                g_buttonPointerPressed = false;
+                UpdateButtonInteractionVisual();
+            }
+        });
+    g_pointerCanceledToken = root.PointerCanceled(
+        [](winrt::Windows::Foundation::IInspectable const&,
+           wuxi::PointerRoutedEventArgs const&) {
+            if (!g_unloading) {
+                g_buttonPointerPressed = false;
+                UpdateButtonInteractionVisual();
+            }
+        });
+    g_pointerCaptureLostToken = root.PointerCaptureLost(
+        [](winrt::Windows::Foundation::IInspectable const&,
+           wuxi::PointerRoutedEventArgs const&) {
+            if (!g_unloading) {
+                g_buttonPointerPressed = false;
+                UpdateButtonInteractionVisual();
+            }
+        });
+    g_actualThemeChangedToken = root.ActualThemeChanged(
         [](FrameworkElement const&,
            winrt::Windows::Foundation::IInspectable const&) {
             if (!g_unloading) {
@@ -1309,7 +1288,6 @@ Grid BuildButtonRoot() {
 
     root.Children().Append(background);
     root.Children().Append(icon);
-    root.Children().Append(button);
     g_injectionRoot = root;
     return root;
 }
@@ -1320,12 +1298,14 @@ bool EnsureButtonInjected() {
     bool columnInserted = false;
 
     try {
+        DebugLog(L"EnsureButtonInjected: starting");
         trayGrid = FindSystemTrayGrid();
         if (!trayGrid) {
             return false;
         }
 
         if (IsCurrentRootInGrid(trayGrid)) {
+            DebugLog(L"EnsureButtonInjected: button is already present");
             UpdateButtonVisual();
             return true;
         }
@@ -1356,13 +1336,21 @@ bool EnsureButtonInjected() {
         UpdateButtonThemeColors();
         UpdateButtonVisual();
         Wh_Log(L"Lid closing mode button injected");
+        DebugLog(L"EnsureButtonInjected: button injected");
         return true;
     } catch (const winrt::hresult_error& error) {
         Wh_Log(L"Button injection failed: 0x%08X (%ls)",
                static_cast<unsigned>(error.code().value),
                error.message().c_str());
+        wchar_t code[32];
+        swprintf_s(code,
+                   L"EnsureButtonInjected: failed with 0x%08X: ",
+                   static_cast<unsigned>(error.code().value));
+        DebugLog(std::wstring(code) + error.message().c_str());
     } catch (...) {
         Wh_Log(L"Button injection failed with an unknown exception");
+        DebugLog(
+            L"EnsureButtonInjected: failed with an unknown exception");
     }
 
     if (trayGrid && columnInserted) {
@@ -1385,6 +1373,8 @@ bool EnsureButtonInjected() {
             }
         } catch (...) {
             Wh_Log(L"Failed to roll back taskbar column injection");
+            DebugLog(
+                L"EnsureButtonInjected: failed to roll back injection");
         }
     }
 
@@ -1428,6 +1418,7 @@ void RemoveButtonOnTaskbarThread(void*) {
 void SyncButtonWithTaskbar() {
     HWND hWnd = FindCurrentProcessTaskbarWnd();
     if (!hWnd) {
+        DebugLog(L"SyncButtonWithTaskbar: taskbar window was not found");
         return;
     }
 
@@ -1435,6 +1426,8 @@ void SyncButtonWithTaskbar() {
     if (!RunFromWindowThread(
             hWnd, EnsureButtonOnTaskbarThread, nullptr)) {
         Wh_Log(L"Failed to marshal button update to the taskbar thread");
+        DebugLog(
+            L"SyncButtonWithTaskbar: taskbar thread marshal failed");
     }
 }
 
