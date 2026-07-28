@@ -16,6 +16,17 @@ It follows the current power source:
 Connecting or disconnecting the charger updates the button immediately. A moon
 icon means Sleep, and a blocked icon means Do nothing.
 
+## Settings
+
+**Separate plugged-in and battery modes** is enabled by default:
+
+- Enabled: the button reads and changes only the current power source.
+- Disabled: the button reads and changes AC and DC together.
+
+If AC and DC already differ when linked mode is selected, the button shows a
+question mark without changing either value. The next click explicitly sets
+both to Sleep.
+
 ## Install
 
 1. Open Windhawk.

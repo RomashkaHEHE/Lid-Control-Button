@@ -2,7 +2,7 @@
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
 // @description     Adds a taskbar button that switches lid closing between sleep and do nothing
-// @version         1.2.0
+// @version         1.3.0
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
@@ -26,6 +26,9 @@ changes only the **Plugged in** value. On battery, it displays and changes only
 the **On battery** value. Switching the power source updates the button
 immediately without polling.
 
+The separate behavior can be disabled in the mod settings. In linked mode,
+the button displays and changes the plugged-in and battery values together.
+
 The moon icon means **Sleep**. The blocked icon means **Do nothing**. Other
 lid actions show a question mark, and the next click sets the current power
 source's value to **Sleep**.
@@ -33,6 +36,17 @@ source's value to **Sleep**.
 This mod targets the Windows 11 XAML taskbar.
 */
 // ==/WindhawkModReadme==
+
+// ==WindhawkModSettings==
+/*
+- separatePowerSources: true
+  $name: Separate plugged-in and battery modes
+  $description: >-
+    When enabled, the button displays and changes only the current power
+    source's lid action. When disabled, the button displays and changes the
+    plugged-in and battery actions together.
+*/
+// ==/WindhawkModSettings==
 
 #undef GetCurrentTime
 
@@ -131,11 +145,15 @@ enum class LidMode {
 struct LidSetting {
     LidMode mode = LidMode::Unavailable;
     PowerSource source = PowerSource::Unknown;
+    bool separatePowerSources = true;
+    DWORD acValue = 0;
+    DWORD dcValue = 0;
     DWORD activeValue = 0;
     DWORD error = ERROR_SUCCESS;
 };
 
 std::atomic<bool> g_unloading{false};
+std::atomic<bool> g_separatePowerSources{true};
 std::atomic<HWND> g_taskbarWnd{nullptr};
 HPOWERNOTIFY g_lidCloseNotification = nullptr;
 HPOWERNOTIFY g_activeSchemeNotification = nullptr;
@@ -169,6 +187,12 @@ void* CTaskBand_ITaskListWndSite_vftable = nullptr;
 using RunFromWindowThreadProc = void (*)(void*);
 
 void SyncButtonWithTaskbar();
+
+void LoadSettings() {
+    g_separatePowerSources.store(
+        Wh_GetIntSetting(L"separatePowerSources") != 0,
+        std::memory_order_release);
+}
 
 bool RunFromWindowThread(HWND hWnd,
                          RunFromWindowThreadProc proc,
@@ -429,8 +453,14 @@ PowerSource GetCurrentPowerSource(DWORD* error) {
 
 LidSetting ReadLidSetting() {
     LidSetting result;
-    result.source = GetCurrentPowerSource(&result.error);
-    if (result.source == PowerSource::Unknown) {
+    result.separatePowerSources =
+        g_separatePowerSources.load(std::memory_order_acquire);
+
+    DWORD sourceError = ERROR_SUCCESS;
+    result.source = GetCurrentPowerSource(&sourceError);
+    if (result.separatePowerSources &&
+        result.source == PowerSource::Unknown) {
+        result.error = sourceError;
         return result;
     }
 
@@ -440,13 +470,29 @@ LidSetting ReadLidSetting() {
         return result;
     }
 
-    if (result.source == PowerSource::PluggedIn) {
+    if (!result.separatePowerSources) {
+        result.error = PowerReadACValueIndex(
+            nullptr,
+            activeScheme,
+            &kSystemButtonSubgroup,
+            &kLidCloseAction,
+            &result.acValue);
+        if (result.error == ERROR_SUCCESS) {
+            result.error = PowerReadDCValueIndex(
+                nullptr,
+                activeScheme,
+                &kSystemButtonSubgroup,
+                &kLidCloseAction,
+                &result.dcValue);
+        }
+    } else if (result.source == PowerSource::PluggedIn) {
         result.error = PowerReadACValueIndex(
             nullptr,
             activeScheme,
             &kSystemButtonSubgroup,
             &kLidCloseAction,
             &result.activeValue);
+        result.acValue = result.activeValue;
     } else {
         result.error = PowerReadDCValueIndex(
             nullptr,
@@ -454,11 +500,21 @@ LidSetting ReadLidSetting() {
             &kSystemButtonSubgroup,
             &kLidCloseAction,
             &result.activeValue);
+        result.dcValue = result.activeValue;
     }
     LocalFree(activeScheme);
 
     if (result.error != ERROR_SUCCESS) {
         return result;
+    }
+
+    if (!result.separatePowerSources) {
+        if (result.acValue == result.dcValue) {
+            result.activeValue = result.acValue;
+        } else {
+            result.mode = LidMode::Other;
+            return result;
+        }
     }
 
     if (result.activeValue == kSleepValue) {
@@ -552,6 +608,69 @@ DWORD WriteLidMode(PowerSource source, DWORD value) {
     return error;
 }
 
+DWORD WriteLinkedLidMode(DWORD value) {
+    GUID* activeScheme = nullptr;
+    DWORD error = PowerGetActiveScheme(nullptr, &activeScheme);
+    if (error != ERROR_SUCCESS || !activeScheme) {
+        return error != ERROR_SUCCESS ? error : ERROR_INVALID_DATA;
+    }
+
+    DWORD oldAcValue = 0;
+    DWORD oldDcValue = 0;
+    error = PowerReadACValueIndex(nullptr,
+                                  activeScheme,
+                                  &kSystemButtonSubgroup,
+                                  &kLidCloseAction,
+                                  &oldAcValue);
+    if (error == ERROR_SUCCESS) {
+        error = PowerReadDCValueIndex(nullptr,
+                                      activeScheme,
+                                      &kSystemButtonSubgroup,
+                                      &kLidCloseAction,
+                                      &oldDcValue);
+    }
+    if (error != ERROR_SUCCESS) {
+        LocalFree(activeScheme);
+        return error;
+    }
+
+    error = PowerWriteACValueIndex(nullptr,
+                                   activeScheme,
+                                   &kSystemButtonSubgroup,
+                                   &kLidCloseAction,
+                                   value);
+    if (error != ERROR_SUCCESS) {
+        LocalFree(activeScheme);
+        return error;
+    }
+
+    error = PowerWriteDCValueIndex(nullptr,
+                                   activeScheme,
+                                   &kSystemButtonSubgroup,
+                                   &kLidCloseAction,
+                                   value);
+    if (error == ERROR_SUCCESS) {
+        error = PowerSetActiveScheme(nullptr, activeScheme);
+    }
+
+    if (error != ERROR_SUCCESS) {
+        PowerWriteACValueIndex(nullptr,
+                               activeScheme,
+                               &kSystemButtonSubgroup,
+                               &kLidCloseAction,
+                               oldAcValue);
+        PowerWriteDCValueIndex(nullptr,
+                               activeScheme,
+                               &kSystemButtonSubgroup,
+                               &kLidCloseAction,
+                               oldDcValue);
+        PowerSetActiveScheme(nullptr, activeScheme);
+    }
+
+    LocalFree(activeScheme);
+    return error;
+}
+
 std::wstring PowerValueName(DWORD value) {
     switch (value) {
         case 0:
@@ -586,6 +705,15 @@ std::wstring PowerSourceName(PowerSource source) {
            L"\u043d\u0435 \u043e\u043f\u0440\u0435\u0434\u0435\u043b\u0451\u043d";
 }
 
+std::wstring PowerScopeName(LidSetting const& setting) {
+    if (!setting.separatePowerSources) {
+        return L"\u041f\u0438\u0442\u0430\u043d\u0438\u0435: "
+               L"\u043e\u0442 \u0441\u0435\u0442\u0438 \u0438 "
+               L"\u043e\u0442 \u0431\u0430\u0442\u0430\u0440\u0435\u0438";
+    }
+    return PowerSourceName(setting.source);
+}
+
 void UpdateButtonVisual() {
     if (!g_button || !g_icon) {
         return;
@@ -617,7 +745,7 @@ void UpdateButtonVisual() {
             L"\u043a\u0440\u044b\u0448\u043a\u0438: \u0441\u043e\u043d";
         tooltip =
             accessibleName +
-            L"\n" + PowerSourceName(setting.source) +
+            L"\n" + PowerScopeName(setting) +
             L"\n\u041d\u0430\u0436\u043c\u0438\u0442\u0435: "
             L"\u043d\u0438\u0447\u0435\u0433\u043e "
             L"\u043d\u0435 \u0434\u0435\u043b\u0430\u0442\u044c";
@@ -630,21 +758,46 @@ void UpdateButtonVisual() {
             L"\u043d\u0435 \u0434\u0435\u043b\u0430\u0442\u044c";
         tooltip =
             accessibleName +
-            L"\n" + PowerSourceName(setting.source) +
+            L"\n" + PowerScopeName(setting) +
             L"\n\u041d\u0430\u0436\u043c\u0438\u0442\u0435: "
             L"\u0441\u043e\u043d";
     } else if (setting.mode == LidMode::Other) {
         glyph = L"?";
-        accessibleName =
-            L"\u0417\u0430\u043a\u0440\u044b\u0442\u0438\u0435 "
-            L"\u043a\u0440\u044b\u0448\u043a\u0438: " +
-            PowerValueName(setting.activeValue);
-        tooltip =
-            accessibleName +
-            L"\n" + PowerSourceName(setting.source) +
-            L"\n\u041d\u0430\u0436\u043c\u0438\u0442\u0435: "
-            L"\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c "
-            L"\u0441\u043e\u043d";
+        if (!setting.separatePowerSources) {
+            if (setting.acValue != setting.dcValue) {
+                accessibleName =
+                    L"\u0420\u0435\u0436\u0438\u043c\u044b "
+                    L"\u0437\u0430\u043a\u0440\u044b\u0442\u0438\u044f "
+                    L"\u043a\u0440\u044b\u0448\u043a\u0438 "
+                    L"\u0440\u0430\u0437\u043b\u0438\u0447\u0430\u044e\u0442\u0441\u044f";
+            } else {
+                accessibleName =
+                    L"\u0417\u0430\u043a\u0440\u044b\u0442\u0438\u0435 "
+                    L"\u043a\u0440\u044b\u0448\u043a\u0438: " +
+                    PowerValueName(setting.acValue);
+            }
+            tooltip =
+                accessibleName +
+                L"\n\u041e\u0442 \u0441\u0435\u0442\u0438: " +
+                PowerValueName(setting.acValue) +
+                L"\n\u041e\u0442 \u0431\u0430\u0442\u0430\u0440\u0435\u0438: " +
+                PowerValueName(setting.dcValue) +
+                L"\n\u041d\u0430\u0436\u043c\u0438\u0442\u0435: "
+                L"\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c "
+                L"\u0441\u043e\u043d \u0434\u043b\u044f "
+                L"\u043e\u0431\u043e\u0438\u0445 \u0440\u0435\u0436\u0438\u043c\u043e\u0432";
+        } else {
+            accessibleName =
+                L"\u0417\u0430\u043a\u0440\u044b\u0442\u0438\u0435 "
+                L"\u043a\u0440\u044b\u0448\u043a\u0438: " +
+                PowerValueName(setting.activeValue);
+            tooltip =
+                accessibleName +
+                L"\n" + PowerScopeName(setting) +
+                L"\n\u041d\u0430\u0436\u043c\u0438\u0442\u0435: "
+                L"\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c "
+                L"\u0441\u043e\u043d";
+        }
     } else {
         glyph = L"!";
         accessibleName =
@@ -670,9 +823,12 @@ void OnButtonClick() {
     DWORD target = current.mode == LidMode::Sleep
                        ? kDoNothingValue
                        : kSleepValue;
-    DWORD error = current.error == ERROR_SUCCESS
-                      ? WriteLidMode(current.source, target)
-                      : current.error;
+    DWORD error = current.error;
+    if (error == ERROR_SUCCESS) {
+        error = current.separatePowerSources
+                    ? WriteLidMode(current.source, target)
+                    : WriteLinkedLidMode(target);
+    }
 
     if (error == ERROR_RETRY) {
         g_lastOperationError = ERROR_SUCCESS;
@@ -681,9 +837,14 @@ void OnButtonClick() {
     } else if (error == ERROR_SUCCESS) {
         g_lastOperationError = ERROR_SUCCESS;
         g_lastOperationErrorExpiresAt = 0;
-        Wh_Log(L"Lid close action changed to %ls for %ls",
-               target == kSleepValue ? L"sleep" : L"do nothing",
-               current.source == PowerSource::PluggedIn ? L"AC" : L"DC");
+        if (current.separatePowerSources) {
+            Wh_Log(L"Lid close action changed to %ls for %ls",
+                   target == kSleepValue ? L"sleep" : L"do nothing",
+                   current.source == PowerSource::PluggedIn ? L"AC" : L"DC");
+        } else {
+            Wh_Log(L"Lid close action changed to %ls for AC and DC",
+                   target == kSleepValue ? L"sleep" : L"do nothing");
+        }
     } else {
         g_lastOperationError = error;
         g_lastOperationErrorExpiresAt = GetTickCount64() + 8000;
@@ -1255,6 +1416,7 @@ bool PrepareSystemTrayHook() {
 
 BOOL Wh_ModInit() {
     Wh_Log(L"Initializing Lid Closing Mode Button");
+    LoadSettings();
     if (!ResolveTaskbarSymbols()) {
         Wh_Log(L"Failed to resolve taskbar symbols");
         return FALSE;
@@ -1293,4 +1455,11 @@ void Wh_ModUninit() {
     }
 
     Wh_Log(L"Lid Closing Mode Button unloaded");
+}
+
+void Wh_ModSettingsChanged() {
+    LoadSettings();
+    g_lastOperationError = ERROR_SUCCESS;
+    g_lastOperationErrorExpiresAt = 0;
+    SyncButtonWithTaskbar();
 }
