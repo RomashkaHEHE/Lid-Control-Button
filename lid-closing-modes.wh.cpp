@@ -2,12 +2,12 @@
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
 // @description     Adds a taskbar button that cycles through selected lid-close actions
-// @version         1.7.1
+// @version         1.8.0
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
 // @license         MIT
-// @compilerOptions -DWIN32_LEAN_AND_MEAN -lole32 -loleaut32 -lruntimeobject -lwindowsapp -luser32 -lversion -lpowrprof
+// @compilerOptions -DWIN32_LEAN_AND_MEAN -lole32 -loleaut32 -lruntimeobject -lwindowsapp -ladvapi32 -luser32 -lversion -lpowrprof
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -39,6 +39,12 @@ The moon icon means **Sleep**, the blocked icon means **Do nothing**, and the
 power icon means **Shut down**. Other lid actions show a question mark, and the
 next click selects the first enabled action in the cycle.
 
+Optional safety rules can put the laptop to sleep or shut it down if the lid
+remains closed while the selected lid action is **Do nothing**. Plugged-in and
+battery rules are configured independently. The battery rule can also trigger
+when the remaining charge reaches a configured percentage. These rules use
+Windows power notifications and a one-shot timer; they don't poll.
+
 This mod targets the Windows 11 XAML taskbar.
 */
 // ==/WindhawkModReadme==
@@ -51,15 +57,44 @@ This mod targets the Windows 11 XAML taskbar.
     When enabled, the button displays and changes only the current power
     source's lid action. When disabled, the button displays and changes the
     plugged-in and battery actions together.
-- cycleSleep: true
-  $name: Include Sleep in the cycle
-  $description: Include Sleep when cycling through lid close actions.
-- cycleDoNothing: true
-  $name: Include Do nothing in the cycle
-  $description: Include Do nothing when cycling through lid close actions.
-- cycleShutDown: false
-  $name: Include Shut down in the cycle
-  $description: Include Shut down when cycling through lid close actions.
+- Cycle:
+  - sleep: true
+    $name: Include Sleep
+  - doNothing: true
+    $name: Include Do nothing
+  - shutDown: false
+    $name: Include Shut down
+- Plugged-in:
+  - enabled: false
+    $name: Enable closed-lid safety action
+    $description: >-
+      Applies only while plugged in and the lid action is Do nothing.
+  - delayMinutes: 60
+    $name: After this many minutes
+    $description: Set to 0 to disable the time trigger.
+  - action: 1
+    $name: Then
+    $options:
+    - 1: Sleep
+    - 3: Shut down
+- Battery:
+  - enabled: false
+    $name: Enable closed-lid safety action
+    $description: >-
+      Applies only on battery power and the lid action is Do nothing.
+  - delayMinutes: 30
+    $name: After this many minutes
+    $description: Set to 0 to disable the time trigger.
+  - remainingPercent: 20
+    $name: At this battery level
+    $description: >-
+      Trigger at or below this percentage. Set to 0 to disable the battery
+      level trigger. If both triggers are enabled, the first one wins.
+  - action: 1
+    $name: Then
+    $options:
+    - 1: Sleep
+    - 3: Shut down
 */
 // ==/WindhawkModSettings==
 
@@ -84,9 +119,11 @@ This mod targets the Windows 11 XAML taskbar.
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <cwchar>
 #include <functional>
 #include <list>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -154,6 +191,22 @@ constexpr GUID kAcDcPowerSource = {
     {0xa6, 0xbd, 0xff, 0x34, 0xff, 0x51, 0x65, 0x48},
 };
 
+// GUID_LIDSWITCH_STATE_CHANGE
+constexpr GUID kLidSwitchState = {
+    0xba3e0f4d,
+    0xb817,
+    0x4094,
+    {0xa2, 0xd1, 0xd5, 0x63, 0x79, 0xe6, 0xa0, 0xf3},
+};
+
+// GUID_BATTERY_PERCENTAGE_REMAINING
+constexpr GUID kBatteryPercentageRemaining = {
+    0xa7ad8041,
+    0xb45a,
+    0x4cae,
+    {0x87, 0xa3, 0xee, 0xcb, 0xb4, 0x68, 0xa9, 0xe1},
+};
+
 enum class PowerSource {
     PluggedIn,
     OnBattery,
@@ -189,12 +242,29 @@ std::atomic<bool> g_separatePowerSources{true};
 std::atomic<bool> g_cycleSleep{true};
 std::atomic<bool> g_cycleDoNothing{true};
 std::atomic<bool> g_cycleShutDown{false};
+std::atomic<bool> g_pluggedInSafetyEnabled{false};
+std::atomic<DWORD> g_pluggedInSafetyDelayMinutes{60};
+std::atomic<DWORD> g_pluggedInSafetyAction{kSleepValue};
+std::atomic<bool> g_batterySafetyEnabled{false};
+std::atomic<DWORD> g_batterySafetyDelayMinutes{30};
+std::atomic<DWORD> g_batterySafetyRemainingPercent{20};
+std::atomic<DWORD> g_batterySafetyAction{kSleepValue};
+std::atomic<unsigned> g_safetySettingsGeneration{0};
 std::atomic<HWND> g_taskbarWnd{nullptr};
 HPOWERNOTIFY g_lidCloseNotification = nullptr;
 HPOWERNOTIFY g_activeSchemeNotification = nullptr;
 HPOWERNOTIFY g_powerSourceNotification = nullptr;
+HPOWERNOTIFY g_lidSwitchNotification = nullptr;
+HPOWERNOTIFY g_batteryPercentageNotification = nullptr;
 std::atomic<unsigned> g_activePowerCallbacks{0};
 std::atomic<bool> g_systemTrayModuleHooked{false};
+
+PTP_TIMER g_safetyTimer = nullptr;
+std::mutex g_safetyMutex;
+bool g_lidClosed = false;
+bool g_safetyActionTriggered = false;
+PowerSource g_safetySource = PowerSource::Unknown;
+ULONGLONG g_safetyEligibleSince = 0;
 
 Grid g_injectionRoot{nullptr};
 Grid g_injectionParent{nullptr};
@@ -239,19 +309,53 @@ void* CTaskBand_ITaskListWndSite_vftable = nullptr;
 using RunFromWindowThreadProc = void (*)(void*);
 
 void SyncButtonWithTaskbar();
+void RefreshSafetySchedule(bool timerFired = false);
 
 void LoadSettings() {
     g_separatePowerSources.store(
         Wh_GetIntSetting(L"separatePowerSources") != 0,
         std::memory_order_release);
     g_cycleSleep.store(
-        Wh_GetIntSetting(L"cycleSleep") != 0,
+        Wh_GetIntSetting(L"Cycle.sleep") != 0,
         std::memory_order_release);
     g_cycleDoNothing.store(
-        Wh_GetIntSetting(L"cycleDoNothing") != 0,
+        Wh_GetIntSetting(L"Cycle.doNothing") != 0,
         std::memory_order_release);
     g_cycleShutDown.store(
-        Wh_GetIntSetting(L"cycleShutDown") != 0,
+        Wh_GetIntSetting(L"Cycle.shutDown") != 0,
+        std::memory_order_release);
+    g_pluggedInSafetyEnabled.store(
+        Wh_GetIntSetting(L"Plugged-in.enabled") != 0,
+        std::memory_order_release);
+    g_pluggedInSafetyDelayMinutes.store(
+        (std::clamp)(Wh_GetIntSetting(L"Plugged-in.delayMinutes"),
+                     0,
+                     10080),
+        std::memory_order_release);
+    int pluggedInAction =
+        Wh_GetIntSetting(L"Plugged-in.action");
+    g_pluggedInSafetyAction.store(
+        pluggedInAction == static_cast<int>(kShutDownValue)
+            ? kShutDownValue
+            : kSleepValue,
+        std::memory_order_release);
+    g_batterySafetyEnabled.store(
+        Wh_GetIntSetting(L"Battery.enabled") != 0,
+        std::memory_order_release);
+    g_batterySafetyDelayMinutes.store(
+        (std::clamp)(Wh_GetIntSetting(L"Battery.delayMinutes"),
+                     0,
+                     10080),
+        std::memory_order_release);
+    g_batterySafetyRemainingPercent.store(
+        (std::clamp)(
+            Wh_GetIntSetting(L"Battery.remainingPercent"), 0, 100),
+        std::memory_order_release);
+    int batteryAction = Wh_GetIntSetting(L"Battery.action");
+    g_batterySafetyAction.store(
+        batteryAction == static_cast<int>(kShutDownValue)
+            ? kShutDownValue
+            : kSleepValue,
         std::memory_order_release);
 }
 
@@ -1226,6 +1330,315 @@ void OnButtonClick() {
     }
 
     UpdateButtonVisual();
+    RefreshSafetySchedule();
+}
+
+struct SafetyRule {
+    bool enabled = false;
+    DWORD delayMinutes = 0;
+    DWORD remainingPercent = 0;
+    DWORD action = kSleepValue;
+};
+
+SafetyRule GetSafetyRule(PowerSource source) {
+    SafetyRule rule;
+    if (source == PowerSource::PluggedIn) {
+        rule.enabled = g_pluggedInSafetyEnabled.load(
+            std::memory_order_acquire);
+        rule.delayMinutes = g_pluggedInSafetyDelayMinutes.load(
+            std::memory_order_acquire);
+        rule.action = g_pluggedInSafetyAction.load(
+            std::memory_order_acquire);
+    } else if (source == PowerSource::OnBattery) {
+        rule.enabled =
+            g_batterySafetyEnabled.load(std::memory_order_acquire);
+        rule.delayMinutes = g_batterySafetyDelayMinutes.load(
+            std::memory_order_acquire);
+        rule.remainingPercent =
+            g_batterySafetyRemainingPercent.load(
+                std::memory_order_acquire);
+        rule.action =
+            g_batterySafetyAction.load(std::memory_order_acquire);
+    }
+    return rule;
+}
+
+DWORD CurrentSourceLidValue(LidSetting const& setting) {
+    if (setting.source == PowerSource::PluggedIn) {
+        return setting.separatePowerSources
+                   ? setting.activeValue
+                   : setting.acValue;
+    }
+    if (setting.source == PowerSource::OnBattery) {
+        return setting.separatePowerSources
+                   ? setting.activeValue
+                   : setting.dcValue;
+    }
+    return MAXDWORD;
+}
+
+void CancelSafetyTimerLocked() {
+    if (g_safetyTimer) {
+        SetThreadpoolTimer(g_safetyTimer, nullptr, 0, 0);
+    }
+}
+
+void ScheduleSafetyTimerLocked(ULONGLONG delayMilliseconds) {
+    if (!g_safetyTimer) {
+        return;
+    }
+
+    delayMilliseconds = (std::max)(delayMilliseconds, 1ULL);
+    LARGE_INTEGER dueTime;
+    dueTime.QuadPart =
+        -static_cast<LONGLONG>(delayMilliseconds * 10000ULL);
+    FILETIME dueFileTime{
+        dueTime.LowPart,
+        static_cast<DWORD>(dueTime.HighPart),
+    };
+    SetThreadpoolTimer(g_safetyTimer, &dueFileTime, 0, 0);
+}
+
+void ResetSafetyStateLocked() {
+    g_safetyActionTriggered = false;
+    g_safetySource = PowerSource::Unknown;
+    g_safetyEligibleSince = 0;
+    CancelSafetyTimerLocked();
+}
+
+bool EnableShutdownPrivilege(HANDLE token,
+                             TOKEN_PRIVILEGES* previousPrivileges,
+                             DWORD* previousPrivilegesSize) {
+    LUID shutdownPrivilege;
+    if (!LookupPrivilegeValueW(
+            nullptr, SE_SHUTDOWN_NAME, &shutdownPrivilege)) {
+        return false;
+    }
+
+    TOKEN_PRIVILEGES privileges{};
+    privileges.PrivilegeCount = 1;
+    privileges.Privileges[0].Luid = shutdownPrivilege;
+    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    SetLastError(ERROR_SUCCESS);
+    return AdjustTokenPrivileges(token,
+                                 FALSE,
+                                 &privileges,
+                                 sizeof(*previousPrivileges),
+                                 previousPrivileges,
+                                 previousPrivilegesSize) &&
+           GetLastError() == ERROR_SUCCESS;
+}
+
+void RunSafetyAction(DWORD action) {
+    if (action == kSleepValue) {
+        Wh_Log(L"Closed-lid safety rule is putting the system to sleep");
+        if (!SetSuspendState(FALSE, FALSE, FALSE)) {
+            DWORD error = GetLastError();
+            Wh_Log(L"Closed-lid sleep failed: %lu (%ls)",
+                   error,
+                   FormatError(error).c_str());
+        }
+        return;
+    }
+
+    Wh_Log(L"Closed-lid safety rule is shutting down the system");
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                          &token)) {
+        DWORD error = GetLastError();
+        Wh_Log(L"Failed to open the process token for shutdown: "
+               L"%lu (%ls)",
+               error,
+               FormatError(error).c_str());
+        return;
+    }
+
+    TOKEN_PRIVILEGES previousPrivileges{};
+    DWORD previousPrivilegesSize = sizeof(previousPrivileges);
+    if (!EnableShutdownPrivilege(
+            token, &previousPrivileges, &previousPrivilegesSize)) {
+        DWORD error = GetLastError();
+        CloseHandle(token);
+        Wh_Log(L"Failed to enable shutdown privilege: %lu (%ls)",
+               error,
+               FormatError(error).c_str());
+        return;
+    }
+
+    BOOL shutdownStarted = InitiateSystemShutdownExW(
+        nullptr,
+        nullptr,
+        0,
+        FALSE,
+        FALSE,
+        SHTDN_REASON_MAJOR_POWER |
+            SHTDN_REASON_MINOR_ENVIRONMENT |
+            SHTDN_REASON_FLAG_PLANNED);
+    DWORD shutdownError =
+        shutdownStarted ? ERROR_SUCCESS : GetLastError();
+
+    AdjustTokenPrivileges(token,
+                          FALSE,
+                          &previousPrivileges,
+                          0,
+                          nullptr,
+                          nullptr);
+    CloseHandle(token);
+
+    if (!shutdownStarted) {
+        Wh_Log(L"Closed-lid shutdown failed: %lu (%ls)",
+               shutdownError,
+               FormatError(shutdownError).c_str());
+    }
+}
+
+void RefreshSafetySchedule(bool timerFired) {
+    unsigned settingsGeneration =
+        g_safetySettingsGeneration.load(std::memory_order_acquire);
+    if (g_unloading.load(std::memory_order_acquire) ||
+        (settingsGeneration & 1)) {
+        return;
+    }
+
+    LidSetting setting = ReadLidSetting();
+    SafetyRule rule = GetSafetyRule(setting.source);
+    SYSTEM_POWER_STATUS powerStatus{};
+    bool hasPowerStatus = GetSystemPowerStatus(&powerStatus) != FALSE;
+    ULONGLONG now = GetTickCount64();
+    DWORD actionToRun = MAXDWORD;
+    PowerSource actionSource = PowerSource::Unknown;
+
+    {
+        std::lock_guard<std::mutex> lock(g_safetyMutex);
+        if (g_safetySettingsGeneration.load(
+                std::memory_order_acquire) != settingsGeneration) {
+            return;
+        }
+
+        bool hasTrigger =
+            rule.delayMinutes != 0 ||
+            (setting.source == PowerSource::OnBattery &&
+             rule.remainingPercent != 0);
+        bool eligible =
+            g_lidClosed && setting.error == ERROR_SUCCESS &&
+            setting.source != PowerSource::Unknown &&
+            CurrentSourceLidValue(setting) == kDoNothingValue &&
+            rule.enabled && hasTrigger;
+
+        if (!eligible) {
+            ResetSafetyStateLocked();
+            return;
+        }
+
+        if (g_safetySource != setting.source) {
+            g_safetyActionTriggered = false;
+            g_safetySource = setting.source;
+            g_safetyEligibleSince = now;
+        } else if (!g_safetyEligibleSince) {
+            g_safetyEligibleSince = now;
+        }
+
+        if (g_safetyActionTriggered) {
+            CancelSafetyTimerLocked();
+            return;
+        }
+
+        bool batteryLevelReached =
+            setting.source == PowerSource::OnBattery &&
+            rule.remainingPercent != 0 && hasPowerStatus &&
+            powerStatus.BatteryLifePercent != 255 &&
+            powerStatus.BatteryLifePercent <= rule.remainingPercent;
+
+        ULONGLONG delayMilliseconds =
+            static_cast<ULONGLONG>(rule.delayMinutes) * 60ULL * 1000ULL;
+        ULONGLONG elapsed = now - g_safetyEligibleSince;
+        bool delayReached =
+            delayMilliseconds != 0 && elapsed >= delayMilliseconds;
+
+        if (batteryLevelReached || delayReached) {
+            if (timerFired) {
+                g_safetyActionTriggered = true;
+                CancelSafetyTimerLocked();
+                actionToRun = rule.action;
+                actionSource = setting.source;
+            } else {
+                ScheduleSafetyTimerLocked(1);
+            }
+        } else if (delayMilliseconds != 0) {
+            ScheduleSafetyTimerLocked(delayMilliseconds - elapsed);
+        } else {
+            CancelSafetyTimerLocked();
+        }
+    }
+
+    if (actionToRun == MAXDWORD) {
+        return;
+    }
+
+    DWORD sourceError = ERROR_SUCCESS;
+    bool sourceStillMatches =
+        GetCurrentPowerSource(&sourceError) == actionSource;
+    bool lidStillClosed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_safetyMutex);
+        lidStillClosed =
+            g_lidClosed && g_safetyActionTriggered &&
+            g_safetySource == actionSource;
+    }
+
+    if (sourceStillMatches && lidStillClosed &&
+        !g_unloading.load(std::memory_order_acquire)) {
+        RunSafetyAction(actionToRun);
+    }
+}
+
+void UpdateLidState(bool closed) {
+    std::lock_guard<std::mutex> lock(g_safetyMutex);
+    if (g_lidClosed == closed) {
+        return;
+    }
+
+    g_lidClosed = closed;
+    ResetSafetyStateLocked();
+    Wh_Log(L"Lid is now %ls", closed ? L"closed" : L"open");
+}
+
+VOID CALLBACK SafetyTimerCallback(PTP_CALLBACK_INSTANCE,
+                                  PVOID,
+                                  PTP_TIMER) {
+    RefreshSafetySchedule(true);
+}
+
+bool CreateSafetyTimer() {
+    g_safetyTimer =
+        CreateThreadpoolTimer(SafetyTimerCallback, nullptr, nullptr);
+    if (!g_safetyTimer) {
+        DWORD error = GetLastError();
+        Wh_Log(L"Failed to create the closed-lid safety timer: "
+               L"%lu (%ls)",
+               error,
+               FormatError(error).c_str());
+        return false;
+    }
+    return true;
+}
+
+void CloseSafetyTimer() {
+    PTP_TIMER timer = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_safetyMutex);
+        timer = g_safetyTimer;
+        if (!timer) {
+            return;
+        }
+        SetThreadpoolTimer(timer, nullptr, 0, 0);
+        g_safetyTimer = nullptr;
+    }
+
+    WaitForThreadpoolTimerCallbacks(timer, TRUE);
+    CloseThreadpoolTimer(timer);
 }
 
 void ReleaseButtonReferences() {
@@ -1596,13 +2009,36 @@ ULONG CALLBACK PowerSettingNotificationCallback(PVOID,
     if (!g_unloading && type == PBT_POWERSETTINGCHANGE && setting) {
         const auto* powerSetting =
             static_cast<const POWERBROADCAST_SETTING*>(setting);
-        if (InlineIsEqualGUID(powerSetting->PowerSetting,
-                              kLidCloseAction) ||
-            InlineIsEqualGUID(powerSetting->PowerSetting,
-                              kActivePowerScheme) ||
-            InlineIsEqualGUID(powerSetting->PowerSetting,
-                              kAcDcPowerSource)) {
+        bool lidActionChanged = InlineIsEqualGUID(
+            powerSetting->PowerSetting, kLidCloseAction);
+        bool schemeChanged = InlineIsEqualGUID(
+            powerSetting->PowerSetting, kActivePowerScheme);
+        bool powerSourceChanged = InlineIsEqualGUID(
+            powerSetting->PowerSetting, kAcDcPowerSource);
+        bool lidStateChanged = InlineIsEqualGUID(
+            powerSetting->PowerSetting, kLidSwitchState);
+        bool batteryLevelChanged = InlineIsEqualGUID(
+            powerSetting->PowerSetting,
+            kBatteryPercentageRemaining);
+
+        if (lidStateChanged &&
+            powerSetting->DataLength >= sizeof(DWORD)) {
+            DWORD lidState = 0;
+            std::memcpy(
+                &lidState, powerSetting->Data, sizeof(lidState));
+            if (lidState <= 1) {
+                UpdateLidState(lidState == 0);
+            }
+        }
+
+        if (lidActionChanged || schemeChanged ||
+            powerSourceChanged) {
             SyncButtonWithTaskbar();
+        }
+        if (lidActionChanged || schemeChanged ||
+            powerSourceChanged || lidStateChanged ||
+            batteryLevelChanged) {
+            RefreshSafetySchedule();
         }
     }
 
@@ -1659,6 +2095,48 @@ bool RegisterPowerNotifications() {
         return false;
     }
 
+    error = PowerSettingRegisterNotification(
+        &kLidSwitchState,
+        DEVICE_NOTIFY_CALLBACK,
+        reinterpret_cast<HANDLE>(&parameters),
+        &g_lidSwitchNotification);
+    if (error != ERROR_SUCCESS) {
+        Wh_Log(L"Failed to register lid state notifications: %lu",
+               error);
+        PowerSettingUnregisterNotification(
+            g_powerSourceNotification);
+        PowerSettingUnregisterNotification(
+            g_activeSchemeNotification);
+        PowerSettingUnregisterNotification(g_lidCloseNotification);
+        g_lidCloseNotification = nullptr;
+        g_activeSchemeNotification = nullptr;
+        g_powerSourceNotification = nullptr;
+        g_lidSwitchNotification = nullptr;
+        return false;
+    }
+
+    error = PowerSettingRegisterNotification(
+        &kBatteryPercentageRemaining,
+        DEVICE_NOTIFY_CALLBACK,
+        reinterpret_cast<HANDLE>(&parameters),
+        &g_batteryPercentageNotification);
+    if (error != ERROR_SUCCESS) {
+        Wh_Log(L"Failed to register battery level notifications: %lu",
+               error);
+        PowerSettingUnregisterNotification(g_lidSwitchNotification);
+        PowerSettingUnregisterNotification(
+            g_powerSourceNotification);
+        PowerSettingUnregisterNotification(
+            g_activeSchemeNotification);
+        PowerSettingUnregisterNotification(g_lidCloseNotification);
+        g_lidCloseNotification = nullptr;
+        g_activeSchemeNotification = nullptr;
+        g_powerSourceNotification = nullptr;
+        g_lidSwitchNotification = nullptr;
+        g_batteryPercentageNotification = nullptr;
+        return false;
+    }
+
     Wh_Log(L"Power setting notifications registered");
     return true;
 }
@@ -1669,9 +2147,15 @@ void UnregisterPowerNotifications() {
         g_activeSchemeNotification;
     HPOWERNOTIFY powerSourceNotification =
         g_powerSourceNotification;
+    HPOWERNOTIFY lidSwitchNotification =
+        g_lidSwitchNotification;
+    HPOWERNOTIFY batteryPercentageNotification =
+        g_batteryPercentageNotification;
     g_lidCloseNotification = nullptr;
     g_activeSchemeNotification = nullptr;
     g_powerSourceNotification = nullptr;
+    g_lidSwitchNotification = nullptr;
+    g_batteryPercentageNotification = nullptr;
 
     if (lidCloseNotification) {
         DWORD error =
@@ -1698,6 +2182,25 @@ void UnregisterPowerNotifications() {
         if (error != ERROR_SUCCESS) {
             Wh_Log(
                 L"Failed to unregister power source notifications: %lu",
+                error);
+        }
+    }
+
+    if (lidSwitchNotification) {
+        DWORD error = PowerSettingUnregisterNotification(
+            lidSwitchNotification);
+        if (error != ERROR_SUCCESS) {
+            Wh_Log(L"Failed to unregister lid state notifications: %lu",
+                   error);
+        }
+    }
+
+    if (batteryPercentageNotification) {
+        DWORD error = PowerSettingUnregisterNotification(
+            batteryPercentageNotification);
+        if (error != ERROR_SUCCESS) {
+            Wh_Log(
+                L"Failed to unregister battery level notifications: %lu",
                 error);
         }
     }
@@ -1910,7 +2413,11 @@ BOOL Wh_ModInit() {
     if (!PrepareSystemTrayHook()) {
         return FALSE;
     }
+    if (!CreateSafetyTimer()) {
+        return FALSE;
+    }
     if (!RegisterPowerNotifications()) {
+        CloseSafetyTimer();
         return FALSE;
     }
     return TRUE;
@@ -1927,6 +2434,7 @@ void Wh_ModAfterInit() {
 void Wh_ModUninit() {
     g_unloading = true;
     UnregisterPowerNotifications();
+    CloseSafetyTimer();
 
     HWND hWnd = g_taskbarWnd.load(std::memory_order_acquire);
     if (!hWnd || !IsWindow(hWnd)) {
@@ -1944,8 +2452,17 @@ void Wh_ModUninit() {
 }
 
 void Wh_ModSettingsChanged() {
+    g_safetySettingsGeneration.fetch_add(
+        1, std::memory_order_acq_rel);
+    {
+        std::lock_guard<std::mutex> lock(g_safetyMutex);
+        ResetSafetyStateLocked();
+    }
     LoadSettings();
+    g_safetySettingsGeneration.fetch_add(
+        1, std::memory_order_acq_rel);
     g_lastOperationError = ERROR_SUCCESS;
     g_lastOperationErrorExpiresAt = 0;
     SyncButtonWithTaskbar();
+    RefreshSafetySchedule();
 }

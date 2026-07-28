@@ -39,14 +39,30 @@ If AC and DC already differ when linked mode is selected, the button shows a
 question mark without changing either value. The next click sets both to the
 first enabled action in the cycle.
 
-The cycle has one toggle for each supported action:
+The **Cycle** group has one toggle for each supported action:
 
-- **Include Sleep in the cycle**: enabled by default.
-- **Include Do nothing in the cycle**: enabled by default.
-- **Include Shut down in the cycle**: disabled by default.
+- **Include Sleep**: enabled by default.
+- **Include Do nothing**: enabled by default.
+- **Include Shut down**: disabled by default.
 
 If the current action is not enabled, the next click selects the first enabled
 action. If no other action is enabled, clicking the button does nothing.
+
+### Closed-lid safety
+
+The **Plugged in** and **Battery** groups contain independent optional safety
+rules. A rule applies only while its power source is active, the lid is closed,
+and that source's lid action is **Do nothing**.
+
+Each rule can put the laptop to **Sleep** or **Shut down** after a configurable
+number of minutes. Set the delay to `0` to disable the time trigger.
+
+The battery rule also has a remaining-charge trigger. Set its percentage to
+`0` to disable it. When both battery triggers are enabled, the first condition
+reached runs the configured action. Changing power source while the lid is
+closed cancels the previous source's timer and starts the new source's rule.
+
+Safety rules are disabled by default.
 
 ## Install
 
@@ -57,6 +73,7 @@ action. If no other action is enabled, clicking the button does nothing.
 4. Click **Compile Mod**, then enable it.
 
 The mod doesn't poll. It subscribes to Windows notifications for the lid
-action, active power plan, and AC/DC power source. It also listens for
+action, lid state, active power plan, AC/DC power source, and battery
+percentage. Closed-lid delays use a one-shot timer. The mod also listens for
 system-tray XAML reconstruction events so the button is restored when Explorer
 rebuilds the Windows 11 taskbar.
