@@ -2,7 +2,7 @@
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
 // @description     Adds a taskbar button that cycles through selected lid-close actions
-// @version         1.7.0
+// @version         1.7.1
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
@@ -929,34 +929,23 @@ DWORD CurrentCycleValue(LidSetting const& setting) {
     return setting.activeValue;
 }
 
-std::wstring CycleInstruction(DWORD currentValue, bool setBoth) {
-    DWORD nextValue = 0;
-    if (!GetNextCycleValue(currentValue, &nextValue)) {
-        return L"No other actions are enabled in the cycle";
-    }
-
-    return setBoth
-               ? L"Click to set both to " +
-                     PowerValueName(nextValue)
-               : L"Click to switch to " +
-                     PowerValueName(nextValue);
-}
-
-std::wstring PowerSourceName(PowerSource source) {
-    if (source == PowerSource::PluggedIn) {
-        return L"Power source: Plugged in";
-    }
-    if (source == PowerSource::OnBattery) {
-        return L"Power source: On battery";
-    }
-    return L"Power source: Unknown";
-}
-
-std::wstring PowerScopeName(LidSetting const& setting) {
+std::wstring ShortPowerScope(LidSetting const& setting) {
     if (!setting.separatePowerSources) {
-        return L"Power source: Plugged in and on battery";
+        return L"both";
     }
-    return PowerSourceName(setting.source);
+    if (setting.source == PowerSource::PluggedIn) {
+        return L"AC";
+    }
+    if (setting.source == PowerSource::OnBattery) {
+        return L"battery";
+    }
+    return L"?";
+}
+
+std::wstring ShortTooltip(
+    std::wstring const& action,
+    LidSetting const& setting) {
+    return action + L" (" + ShortPowerScope(setting) + L")";
 }
 
 // Mirrors NormalIconView from Windows 11 SystemTrayResources.xbf.
@@ -1134,7 +1123,6 @@ void UpdateButtonVisual() {
     }
 
     LidSetting setting = ReadLidSetting();
-    DWORD currentCycleValue = CurrentCycleValue(setting);
     std::wstring glyph;
     std::wstring accessibleName;
     std::wstring tooltip;
@@ -1145,33 +1133,19 @@ void UpdateButtonVisual() {
     if (showOperationError) {
         glyph = L"!";
         accessibleName = L"Failed to change the lid close action";
-        tooltip =
-            accessibleName + L":\n" +
-            FormatError(g_lastOperationError);
+        tooltip = L"Error";
     } else if (setting.mode == LidMode::Sleep) {
         glyph = L"\xE708";
         accessibleName = L"Lid close action: Sleep";
-        tooltip =
-            accessibleName +
-            L"\n" + PowerScopeName(setting) +
-            L"\n" + CycleInstruction(
-                currentCycleValue, !setting.separatePowerSources);
+        tooltip = ShortTooltip(L"Sleep", setting);
     } else if (setting.mode == LidMode::DoNothing) {
         glyph = L"\xE733";
         accessibleName = L"Lid close action: Do nothing";
-        tooltip =
-            accessibleName +
-            L"\n" + PowerScopeName(setting) +
-            L"\n" + CycleInstruction(
-                currentCycleValue, !setting.separatePowerSources);
+        tooltip = ShortTooltip(L"Do nothing", setting);
     } else if (setting.mode == LidMode::ShutDown) {
         glyph = L"\xE7E8";
         accessibleName = L"Lid close action: Shut down";
-        tooltip =
-            accessibleName +
-            L"\n" + PowerScopeName(setting) +
-            L"\n" + CycleInstruction(
-                currentCycleValue, !setting.separatePowerSources);
+        tooltip = ShortTooltip(L"Shut down", setting);
     } else if (setting.mode == LidMode::Other) {
         glyph = L"?";
         if (!setting.separatePowerSources) {
@@ -1182,28 +1156,23 @@ void UpdateButtonVisual() {
                     L"Lid close action: " +
                     PowerValueName(setting.acValue);
             }
-            tooltip =
-                accessibleName +
-                L"\nPlugged in: " +
-                PowerValueName(setting.acValue) +
-                L"\nOn battery: " +
-                PowerValueName(setting.dcValue) +
-                L"\n" + CycleInstruction(currentCycleValue, true);
+            tooltip = setting.acValue == setting.dcValue
+                          ? ShortTooltip(
+                                PowerValueName(setting.acValue), setting)
+                          : L"AC: " + PowerValueName(setting.acValue) +
+                                L" / Battery: " +
+                                PowerValueName(setting.dcValue);
         } else {
             accessibleName =
                 L"Lid close action: " +
-                PowerValueName(setting.activeValue);
+                    PowerValueName(setting.activeValue);
             tooltip =
-                accessibleName +
-                L"\n" + PowerScopeName(setting) +
-                L"\n" + CycleInstruction(currentCycleValue, false);
+                ShortTooltip(PowerValueName(setting.activeValue), setting);
         }
     } else {
         glyph = L"!";
         accessibleName = L"Lid close action is unavailable";
-        tooltip =
-            accessibleName +
-            L"\n" + FormatError(setting.error);
+        tooltip = L"Unavailable";
     }
 
     g_icon.Glyph(glyph);
