@@ -19,7 +19,7 @@ icon means Sleep, and a blocked icon means Do nothing.
 The button mirrors the native Windows 11 system tray button style: the same
 32-pixel layout width, inset background, one-pixel gradient hover border,
 pressed state, corner radius, and 83 ms background transition. Native theme
-resources cover light, dark, and high contrast modes automatically.
+colors are matched for light, dark, and high contrast modes.
 
 ## Settings
 
