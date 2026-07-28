@@ -2,7 +2,7 @@
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
 // @description     Adds a taskbar button that switches lid closing between sleep and do nothing
-// @version         1.3.0
+// @version         1.4.0
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
@@ -28,6 +28,10 @@ immediately without polling.
 
 The separate behavior can be disabled in the mod settings. In linked mode,
 the button displays and changes the plugged-in and battery values together.
+
+The button uses taskbar-style visual states: transparent at rest, a subtle
+neutral background on hover, and a darker pressed state. The colors adapt to
+light and dark themes.
 
 The moon icon means **Sleep**. The blocked icon means **Do nothing**. Other
 lid actions show a question mark, and the next click sets the current power
@@ -167,7 +171,13 @@ Button g_button{nullptr};
 FontIcon g_icon{nullptr};
 winrt::event_token g_clickToken{};
 winrt::event_token g_pointerEnteredToken{};
+winrt::event_token g_actualThemeChangedToken{};
 std::list<FrameworkElement::Loaded_revoker> g_iconLoadedRevokers;
+
+SolidColorBrush g_buttonNormalBrush{nullptr};
+SolidColorBrush g_buttonHoverBrush{nullptr};
+SolidColorBrush g_buttonPressedBrush{nullptr};
+SolidColorBrush g_buttonBorderBrush{nullptr};
 
 DWORD g_lastOperationError = ERROR_SUCCESS;
 ULONGLONG g_lastOperationErrorExpiresAt = 0;
@@ -714,6 +724,77 @@ std::wstring PowerScopeName(LidSetting const& setting) {
     return PowerSourceName(setting.source);
 }
 
+void SetButtonBrushResource(Button const& button,
+                            wchar_t const* key,
+                            Brush const& brush) {
+    button.Resources().Insert(winrt::box_value(key), brush);
+}
+
+bool IsButtonThemeLight() {
+    if (!g_button) {
+        return false;
+    }
+
+    ElementTheme theme = g_button.ActualTheme();
+    if (theme == ElementTheme::Light) {
+        return true;
+    }
+    if (theme == ElementTheme::Dark) {
+        return false;
+    }
+
+    return Application::Current().RequestedTheme() ==
+           ApplicationTheme::Light;
+}
+
+void UpdateButtonThemeColors() {
+    if (!g_buttonNormalBrush || !g_buttonHoverBrush ||
+        !g_buttonPressedBrush || !g_buttonBorderBrush) {
+        return;
+    }
+
+    bool light = IsButtonThemeLight();
+    g_buttonNormalBrush.Color({0x00, 0x00, 0x00, 0x00});
+    g_buttonBorderBrush.Color({0x00, 0x00, 0x00, 0x00});
+
+    if (light) {
+        // Black overlays on a light taskbar.
+        g_buttonHoverBrush.Color({0x0F, 0x00, 0x00, 0x00});
+        g_buttonPressedBrush.Color({0x19, 0x00, 0x00, 0x00});
+    } else {
+        // White overlays on a dark taskbar. Pressed is darker than hover.
+        g_buttonHoverBrush.Color({0x18, 0xFF, 0xFF, 0xFF});
+        g_buttonPressedBrush.Color({0x0F, 0xFF, 0xFF, 0xFF});
+    }
+}
+
+void ApplyTaskbarButtonStyle(Button const& button) {
+    g_buttonNormalBrush = SolidColorBrush();
+    g_buttonHoverBrush = SolidColorBrush();
+    g_buttonPressedBrush = SolidColorBrush();
+    g_buttonBorderBrush = SolidColorBrush();
+
+    UpdateButtonThemeColors();
+
+    button.Background(g_buttonNormalBrush);
+    button.BorderBrush(g_buttonBorderBrush);
+    button.BorderThickness({0, 0, 0, 0});
+    button.CornerRadius({4, 4, 4, 4});
+
+    SetButtonBrushResource(
+        button, L"ButtonBackground", g_buttonNormalBrush);
+    SetButtonBrushResource(
+        button, L"ButtonBackgroundPointerOver", g_buttonHoverBrush);
+    SetButtonBrushResource(
+        button, L"ButtonBackgroundPressed", g_buttonPressedBrush);
+    SetButtonBrushResource(
+        button, L"ButtonBorderBrush", g_buttonBorderBrush);
+    SetButtonBrushResource(
+        button, L"ButtonBorderBrushPointerOver", g_buttonBorderBrush);
+    SetButtonBrushResource(
+        button, L"ButtonBorderBrushPressed", g_buttonBorderBrush);
+}
+
 void UpdateButtonVisual() {
     if (!g_button || !g_icon) {
         return;
@@ -865,12 +946,21 @@ void ReleaseButtonReferences() {
             if (g_pointerEnteredToken.value) {
                 g_button.PointerEntered(g_pointerEnteredToken);
             }
+            if (g_actualThemeChangedToken.value) {
+                g_button.ActualThemeChanged(
+                    g_actualThemeChangedToken);
+            }
         } catch (...) {
         }
     }
 
     g_clickToken = {};
     g_pointerEnteredToken = {};
+    g_actualThemeChangedToken = {};
+    g_buttonNormalBrush = nullptr;
+    g_buttonHoverBrush = nullptr;
+    g_buttonPressedBrush = nullptr;
+    g_buttonBorderBrush = nullptr;
     g_icon = nullptr;
     g_button = nullptr;
     g_injectionRoot = nullptr;
@@ -957,6 +1047,10 @@ Grid BuildButtonRoot() {
     icon.FontSize(16);
     button.Content(icon);
 
+    g_button = button;
+    g_icon = icon;
+    ApplyTaskbarButtonStyle(button);
+
     g_clickToken = button.Click(
         [](winrt::Windows::Foundation::IInspectable const&,
            RoutedEventArgs const&) {
@@ -971,11 +1065,16 @@ Grid BuildButtonRoot() {
                 UpdateButtonVisual();
             }
         });
+    g_actualThemeChangedToken = button.ActualThemeChanged(
+        [](FrameworkElement const&,
+           winrt::Windows::Foundation::IInspectable const&) {
+            if (!g_unloading) {
+                UpdateButtonThemeColors();
+            }
+        });
 
     root.Children().Append(button);
     g_injectionRoot = root;
-    g_button = button;
-    g_icon = icon;
     return root;
 }
 
@@ -1018,6 +1117,7 @@ bool EnsureButtonInjected() {
         Grid::SetColumn(newRoot, 0);
         trayGrid.Children().Append(newRoot);
         g_injectionParent = trayGrid;
+        UpdateButtonThemeColors();
         UpdateButtonVisual();
         Wh_Log(L"Lid closing mode button injected");
         return true;

@@ -16,6 +16,10 @@ It follows the current power source:
 Connecting or disconnecting the charger updates the button immediately. A moon
 icon means Sleep, and a blocked icon means Do nothing.
 
+The button matches the taskbar interaction style: no visible background or
+border at rest, a subtle neutral background on hover, and a darker pressed
+state. These colors update automatically for light and dark themes.
+
 ## Settings
 
 **Separate plugged-in and battery modes** is enabled by default:
