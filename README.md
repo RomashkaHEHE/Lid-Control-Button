@@ -8,8 +8,13 @@ The button toggles the active power plan's lid-close action between:
 - Sleep
 - Do nothing
 
-It updates both the plugged-in (AC) and battery (DC) values used by
-`powercfg.cpl`. A moon icon means Sleep, and a blocked icon means Do nothing.
+It follows the current power source:
+
+- While plugged in, it displays and changes only the plugged-in (AC) value.
+- On battery, it displays and changes only the battery (DC) value.
+
+Connecting or disconnecting the charger updates the button immediately. A moon
+icon means Sleep, and a blocked icon means Do nothing.
 
 ## Install
 
@@ -19,7 +24,7 @@ It updates both the plugged-in (AC) and battery (DC) values used by
    [`lid-closing-modes.wh.cpp`](lid-closing-modes.wh.cpp).
 4. Click **Compile Mod**, then enable it.
 
-The mod doesn't poll. It subscribes to Windows power-setting notifications and
-updates immediately when the lid action or active power plan changes. It also
-listens for system-tray XAML reconstruction events so the button is restored
-when Explorer rebuilds the Windows 11 taskbar.
+The mod doesn't poll. It subscribes to Windows notifications for the lid
+action, active power plan, and AC/DC power source. It also listens for
+system-tray XAML reconstruction events so the button is restored when Explorer
+rebuilds the Windows 11 taskbar.
