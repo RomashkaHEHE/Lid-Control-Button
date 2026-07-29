@@ -2,7 +2,7 @@
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
 // @description     Adds a taskbar button that cycles through selected lid-close actions
-// @version         1.8.0
+// @version         1.8.1
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
@@ -41,9 +41,9 @@ next click selects the first enabled action in the cycle.
 
 Optional safety rules can put the laptop to sleep or shut it down if the lid
 remains closed while the selected lid action is **Do nothing**. Plugged-in and
-battery rules are configured independently. The battery rule can also trigger
-when the remaining charge reaches a configured percentage. These rules use
-Windows power notifications and a one-shot timer; they don't poll.
+battery rules are configured independently. The battery rule can use either a
+time delay or a remaining-charge threshold. These rules use Windows power
+notifications and a one-shot timer; they don't poll.
 
 This mod targets the Windows 11 XAML taskbar.
 */
@@ -73,7 +73,7 @@ This mod targets the Windows 11 XAML taskbar.
     $name: After this many minutes
     $description: Set to 0 to disable the time trigger.
   - action: 1
-    $name: Then
+    $name: Safety action
     $options:
     - 1: Sleep
     - 3: Shut down
@@ -82,16 +82,23 @@ This mod targets the Windows 11 XAML taskbar.
     $name: Enable closed-lid safety action
     $description: >-
       Applies only on battery power and the lid action is Do nothing.
+  - trigger: 0
+    $name: Trigger
+    $options:
+    - 0: After a delay
+    - 1: At battery level
   - delayMinutes: 30
-    $name: After this many minutes
-    $description: Set to 0 to disable the time trigger.
-  - remainingPercent: 20
-    $name: At this battery level
+    $name: Delay in minutes
     $description: >-
-      Trigger at or below this percentage. Set to 0 to disable the battery
-      level trigger. If both triggers are enabled, the first one wins.
+      Used when Trigger is set to After a delay. Set to 0 to disable the
+      safety rule.
+  - remainingPercent: 20
+    $name: Remaining battery (%)
+    $description: >-
+      Used when Trigger is set to At battery level. The action runs at or
+      below this percentage. Set to 0 to disable the safety rule.
   - action: 1
-    $name: Then
+    $name: Safety action
     $options:
     - 1: Sleep
     - 3: Shut down
@@ -246,6 +253,7 @@ std::atomic<bool> g_pluggedInSafetyEnabled{false};
 std::atomic<DWORD> g_pluggedInSafetyDelayMinutes{60};
 std::atomic<DWORD> g_pluggedInSafetyAction{kSleepValue};
 std::atomic<bool> g_batterySafetyEnabled{false};
+std::atomic<bool> g_batterySafetyUsePercentage{false};
 std::atomic<DWORD> g_batterySafetyDelayMinutes{30};
 std::atomic<DWORD> g_batterySafetyRemainingPercent{20};
 std::atomic<DWORD> g_batterySafetyAction{kSleepValue};
@@ -341,6 +349,9 @@ void LoadSettings() {
         std::memory_order_release);
     g_batterySafetyEnabled.store(
         Wh_GetIntSetting(L"Battery.enabled") != 0,
+        std::memory_order_release);
+    g_batterySafetyUsePercentage.store(
+        Wh_GetIntSetting(L"Battery.trigger") == 1,
         std::memory_order_release);
     g_batterySafetyDelayMinutes.store(
         (std::clamp)(Wh_GetIntSetting(L"Battery.delayMinutes"),
@@ -1335,6 +1346,7 @@ void OnButtonClick() {
 
 struct SafetyRule {
     bool enabled = false;
+    bool useBatteryPercentage = false;
     DWORD delayMinutes = 0;
     DWORD remainingPercent = 0;
     DWORD action = kSleepValue;
@@ -1352,6 +1364,9 @@ SafetyRule GetSafetyRule(PowerSource source) {
     } else if (source == PowerSource::OnBattery) {
         rule.enabled =
             g_batterySafetyEnabled.load(std::memory_order_acquire);
+        rule.useBatteryPercentage =
+            g_batterySafetyUsePercentage.load(
+                std::memory_order_acquire);
         rule.delayMinutes = g_batterySafetyDelayMinutes.load(
             std::memory_order_acquire);
         rule.remainingPercent =
@@ -1518,9 +1533,11 @@ void RefreshSafetySchedule(bool timerFired) {
         }
 
         bool hasTrigger =
-            rule.delayMinutes != 0 ||
-            (setting.source == PowerSource::OnBattery &&
-             rule.remainingPercent != 0);
+            setting.source == PowerSource::OnBattery
+                ? (rule.useBatteryPercentage
+                       ? rule.remainingPercent != 0
+                       : rule.delayMinutes != 0)
+                : rule.delayMinutes != 0;
         bool eligible =
             g_lidClosed && setting.error == ERROR_SUCCESS &&
             setting.source != PowerSource::Unknown &&
@@ -1547,12 +1564,16 @@ void RefreshSafetySchedule(bool timerFired) {
 
         bool batteryLevelReached =
             setting.source == PowerSource::OnBattery &&
+            rule.useBatteryPercentage &&
             rule.remainingPercent != 0 && hasPowerStatus &&
             powerStatus.BatteryLifePercent != 255 &&
             powerStatus.BatteryLifePercent <= rule.remainingPercent;
 
         ULONGLONG delayMilliseconds =
-            static_cast<ULONGLONG>(rule.delayMinutes) * 60ULL * 1000ULL;
+            rule.useBatteryPercentage
+                ? 0
+                : static_cast<ULONGLONG>(rule.delayMinutes) *
+                      60ULL * 1000ULL;
         ULONGLONG elapsed = now - g_safetyEligibleSince;
         bool delayReached =
             delayMilliseconds != 0 && elapsed >= delayMilliseconds;

@@ -54,13 +54,14 @@ The **Plugged in** and **Battery** groups contain independent optional safety
 rules. A rule applies only while its power source is active, the lid is closed,
 and that source's lid action is **Do nothing**.
 
-Each rule can put the laptop to **Sleep** or **Shut down** after a configurable
-number of minutes. Set the delay to `0` to disable the time trigger.
+Each rule has an explicit **Safety action** setting: **Sleep** or **Shut down**.
+The plugged-in rule runs it after a configurable delay.
 
-The battery rule also has a remaining-charge trigger. Set its percentage to
-`0` to disable it. When both battery triggers are enabled, the first condition
-reached runs the configured action. Changing power source while the lid is
-closed cancels the previous source's timer and starts the new source's rule.
+The battery rule has a **Trigger** setting. Choose either **After a delay** or
+**At battery level**, then configure the corresponding minutes or remaining
+percentage. The unselected condition is ignored. Changing power source while
+the lid is closed cancels the previous source's timer and starts the new
+source's rule.
 
 Safety rules are disabled by default.
 
