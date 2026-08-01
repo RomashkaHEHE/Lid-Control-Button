@@ -2,7 +2,7 @@
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
 // @description     Adds a taskbar button that cycles through selected lid-close actions
-// @version         1.9.2
+// @version         1.9.3
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
@@ -2013,6 +2013,7 @@ void ShowSafetyFlyout() {
         state->flyout.Placement(
             winrt::Windows::UI::Xaml::Controls::Primitives::
                 FlyoutPlacementMode::TopEdgeAlignedRight);
+        state->flyout.ShouldConstrainToRootBounds(false);
 
         StackPanel panel;
         panel.Width(288);
