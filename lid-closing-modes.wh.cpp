@@ -2,7 +2,7 @@
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
 // @description     Adds a taskbar button that cycles through selected lid-close actions
-// @version         1.9.1
+// @version         1.9.2
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
@@ -1356,6 +1356,8 @@ void UpdateButtonVisual() {
         accessibleName = L"Lid close action is unavailable";
         tooltip = L"Unavailable";
     }
+
+    tooltip += L" | v" WH_MOD_VERSION;
 
     g_icon.Glyph(glyph);
     AutomationProperties::SetName(g_button, accessibleName);
