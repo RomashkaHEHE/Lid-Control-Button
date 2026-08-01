@@ -50,9 +50,9 @@ action. If no other action is enabled, clicking the button does nothing.
 
 ### Closed-lid safety
 
-The **Plugged in** and **Battery** groups contain independent optional safety
-rules. A rule applies only while its power source is active, the lid is closed,
-and that source's lid action is **Do nothing**.
+Right-click the taskbar button to configure independent **Plugged in** and
+**Battery** safety rules. A rule applies only while its power source is active,
+the lid is closed, and that source's lid action is **Do nothing**.
 
 Each rule has an explicit **Safety action** setting: **Sleep** or **Shut down**.
 The plugged-in rule runs it after a configurable delay.
@@ -64,6 +64,9 @@ the lid is closed cancels the previous source's timer and starts the new
 source's rule.
 
 Safety rules are disabled by default.
+
+The configuration flyout is created only when it is opened. Its XAML controls
+are released when it closes; only the rule values used by the scheduler remain.
 
 ## Install
 

@@ -2,7 +2,7 @@
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
 // @description     Adds a taskbar button that cycles through selected lid-close actions
-// @version         1.8.1
+// @version         1.9.0
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
@@ -45,6 +45,9 @@ battery rules are configured independently. The battery rule can use either a
 time delay or a remaining-charge threshold. These rules use Windows power
 notifications and a one-shot timer; they don't poll.
 
+Right-click the taskbar button to configure the safety rules. The flyout is
+created on demand and released as soon as it closes.
+
 This mod targets the Windows 11 XAML taskbar.
 */
 // ==/WindhawkModReadme==
@@ -64,44 +67,6 @@ This mod targets the Windows 11 XAML taskbar.
     $name: Include Do nothing
   - shutDown: false
     $name: Include Shut down
-- Plugged-in:
-  - enabled: false
-    $name: Enable closed-lid safety action
-    $description: >-
-      Applies only while plugged in and the lid action is Do nothing.
-  - delayMinutes: 60
-    $name: After this many minutes
-    $description: Set to 0 to disable the time trigger.
-  - action: 1
-    $name: Safety action
-    $options:
-    - 1: Sleep
-    - 3: Shut down
-- Battery:
-  - enabled: false
-    $name: Enable closed-lid safety action
-    $description: >-
-      Applies only on battery power and the lid action is Do nothing.
-  - trigger: 0
-    $name: Trigger
-    $options:
-    - 0: After a delay
-    - 1: At battery level
-  - delayMinutes: 30
-    $name: Delay in minutes
-    $description: >-
-      Used when Trigger is set to After a delay. Set to 0 to disable the
-      safety rule.
-  - remainingPercent: 20
-    $name: Remaining battery (%)
-    $description: >-
-      Used when Trigger is set to At battery level. The action runs at or
-      below this percentage. Set to 0 to disable the safety rule.
-  - action: 1
-    $name: Safety action
-    $options:
-    - 1: Sleep
-    - 3: Shut down
 */
 // ==/WindhawkModSettings==
 
@@ -126,10 +91,13 @@ This mod targets the Windows 11 XAML taskbar.
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
 #include <functional>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -147,6 +115,25 @@ constexpr wchar_t kRootName[] = L"LidClosingModes_Root";
 constexpr DWORD kDoNothingValue = 0;
 constexpr DWORD kSleepValue = 1;
 constexpr DWORD kShutDownValue = 3;
+constexpr int kSafetyStorageVersion = 1;
+constexpr wchar_t kSafetyStorageVersionName[] =
+    L"SafetyFlyout.Version";
+constexpr wchar_t kPluggedInEnabledName[] =
+    L"SafetyFlyout.PluggedIn.Enabled";
+constexpr wchar_t kPluggedInDelayName[] =
+    L"SafetyFlyout.PluggedIn.DelayMinutes";
+constexpr wchar_t kPluggedInActionName[] =
+    L"SafetyFlyout.PluggedIn.Action";
+constexpr wchar_t kBatteryEnabledName[] =
+    L"SafetyFlyout.Battery.Enabled";
+constexpr wchar_t kBatteryTriggerName[] =
+    L"SafetyFlyout.Battery.Trigger";
+constexpr wchar_t kBatteryDelayName[] =
+    L"SafetyFlyout.Battery.DelayMinutes";
+constexpr wchar_t kBatteryPercentName[] =
+    L"SafetyFlyout.Battery.RemainingPercent";
+constexpr wchar_t kBatteryActionName[] =
+    L"SafetyFlyout.Battery.Action";
 
 void DebugLog(std::wstring const& message) {
     std::wstring line =
@@ -244,6 +231,17 @@ struct PowerSchemeLidValues {
     DWORD dcValue = 0;
 };
 
+struct SafetyFlyoutState {
+    Flyout flyout{nullptr};
+    ComboBox source{nullptr};
+    ToggleSwitch enabled{nullptr};
+    ComboBox trigger{nullptr};
+    TextBox threshold{nullptr};
+    ComboBox action{nullptr};
+    TextBlock status{nullptr};
+    Button save{nullptr};
+};
+
 std::atomic<bool> g_unloading{false};
 std::atomic<bool> g_separatePowerSources{true};
 std::atomic<bool> g_cycleSleep{true};
@@ -266,6 +264,7 @@ HPOWERNOTIFY g_lidSwitchNotification = nullptr;
 HPOWERNOTIFY g_batteryPercentageNotification = nullptr;
 std::atomic<unsigned> g_activePowerCallbacks{0};
 std::atomic<bool> g_systemTrayModuleHooked{false};
+std::unique_ptr<SafetyFlyoutState> g_safetyFlyout;
 
 PTP_TIMER g_safetyTimer = nullptr;
 std::mutex g_safetyMutex;
@@ -280,6 +279,7 @@ Grid g_button{nullptr};
 Border g_buttonBackground{nullptr};
 FontIcon g_icon{nullptr};
 winrt::event_token g_tappedToken{};
+winrt::event_token g_rightTappedToken{};
 winrt::event_token g_pointerEnteredToken{};
 winrt::event_token g_pointerExitedToken{};
 winrt::event_token g_pointerPressedToken{};
@@ -319,6 +319,102 @@ using RunFromWindowThreadProc = void (*)(void*);
 void SyncButtonWithTaskbar();
 void RefreshSafetySchedule(bool timerFired = false);
 
+void InitializeSafetyStorage() {
+    if (Wh_GetIntValue(kSafetyStorageVersionName, 0) >=
+        kSafetyStorageVersion) {
+        return;
+    }
+
+    int legacyPluggedInEnabled =
+        Wh_GetIntSetting(L"Plugged-in.enabled");
+    int legacyPluggedInDelay =
+        Wh_GetIntSetting(L"Plugged-in.delayMinutes");
+    int legacyPluggedInAction =
+        Wh_GetIntSetting(L"Plugged-in.action");
+    int legacyBatteryEnabled = Wh_GetIntSetting(L"Battery.enabled");
+    int legacyBatteryTrigger = Wh_GetIntSetting(L"Battery.trigger");
+    int legacyBatteryDelay =
+        Wh_GetIntSetting(L"Battery.delayMinutes");
+    int legacyBatteryPercent =
+        Wh_GetIntSetting(L"Battery.remainingPercent");
+    int legacyBatteryAction = Wh_GetIntSetting(L"Battery.action");
+
+    bool hasLegacyValues =
+        legacyPluggedInEnabled != 0 || legacyPluggedInDelay != 0 ||
+        legacyPluggedInAction != 0 || legacyBatteryEnabled != 0 ||
+        legacyBatteryTrigger != 0 || legacyBatteryDelay != 0 ||
+        legacyBatteryPercent != 0 || legacyBatteryAction != 0;
+
+    int pluggedInDelay = hasLegacyValues
+                             ? (std::clamp)(legacyPluggedInDelay, 0, 10080)
+                             : 60;
+    int batteryDelay = hasLegacyValues
+                           ? (std::clamp)(legacyBatteryDelay, 0, 10080)
+                           : 30;
+    int batteryPercent = hasLegacyValues
+                             ? (std::clamp)(legacyBatteryPercent, 0, 100)
+                             : 20;
+    int pluggedInAction = legacyPluggedInAction == kShutDownValue
+                              ? kShutDownValue
+                              : kSleepValue;
+    int batteryAction = legacyBatteryAction == kShutDownValue
+                            ? kShutDownValue
+                            : kSleepValue;
+
+    bool stored = true;
+    stored = Wh_SetIntValue(kPluggedInEnabledName,
+                            hasLegacyValues && legacyPluggedInEnabled != 0) &&
+             stored;
+    stored = Wh_SetIntValue(kPluggedInDelayName, pluggedInDelay) && stored;
+    stored = Wh_SetIntValue(kPluggedInActionName, pluggedInAction) && stored;
+    stored = Wh_SetIntValue(kBatteryEnabledName,
+                            hasLegacyValues && legacyBatteryEnabled != 0) &&
+             stored;
+    stored = Wh_SetIntValue(kBatteryTriggerName,
+                            hasLegacyValues && legacyBatteryTrigger == 1) &&
+             stored;
+    stored = Wh_SetIntValue(kBatteryDelayName, batteryDelay) && stored;
+    stored = Wh_SetIntValue(kBatteryPercentName, batteryPercent) && stored;
+    stored = Wh_SetIntValue(kBatteryActionName, batteryAction) && stored;
+    if (stored) {
+        Wh_SetIntValue(
+            kSafetyStorageVersionName, kSafetyStorageVersion);
+    }
+}
+
+void LoadSafetySettings() {
+    g_pluggedInSafetyEnabled.store(
+        Wh_GetIntValue(kPluggedInEnabledName, 0) != 0,
+        std::memory_order_release);
+    g_pluggedInSafetyDelayMinutes.store(
+        (std::clamp)(Wh_GetIntValue(kPluggedInDelayName, 60), 0, 10080),
+        std::memory_order_release);
+    g_pluggedInSafetyAction.store(
+        Wh_GetIntValue(kPluggedInActionName, kSleepValue) ==
+                static_cast<int>(kShutDownValue)
+            ? kShutDownValue
+            : kSleepValue,
+        std::memory_order_release);
+    g_batterySafetyEnabled.store(
+        Wh_GetIntValue(kBatteryEnabledName, 0) != 0,
+        std::memory_order_release);
+    g_batterySafetyUsePercentage.store(
+        Wh_GetIntValue(kBatteryTriggerName, 0) == 1,
+        std::memory_order_release);
+    g_batterySafetyDelayMinutes.store(
+        (std::clamp)(Wh_GetIntValue(kBatteryDelayName, 30), 0, 10080),
+        std::memory_order_release);
+    g_batterySafetyRemainingPercent.store(
+        (std::clamp)(Wh_GetIntValue(kBatteryPercentName, 20), 0, 100),
+        std::memory_order_release);
+    g_batterySafetyAction.store(
+        Wh_GetIntValue(kBatteryActionName, kSleepValue) ==
+                static_cast<int>(kShutDownValue)
+            ? kShutDownValue
+            : kSleepValue,
+        std::memory_order_release);
+}
+
 void LoadSettings() {
     g_separatePowerSources.store(
         Wh_GetIntSetting(L"separatePowerSources") != 0,
@@ -332,42 +428,8 @@ void LoadSettings() {
     g_cycleShutDown.store(
         Wh_GetIntSetting(L"Cycle.shutDown") != 0,
         std::memory_order_release);
-    g_pluggedInSafetyEnabled.store(
-        Wh_GetIntSetting(L"Plugged-in.enabled") != 0,
-        std::memory_order_release);
-    g_pluggedInSafetyDelayMinutes.store(
-        (std::clamp)(Wh_GetIntSetting(L"Plugged-in.delayMinutes"),
-                     0,
-                     10080),
-        std::memory_order_release);
-    int pluggedInAction =
-        Wh_GetIntSetting(L"Plugged-in.action");
-    g_pluggedInSafetyAction.store(
-        pluggedInAction == static_cast<int>(kShutDownValue)
-            ? kShutDownValue
-            : kSleepValue,
-        std::memory_order_release);
-    g_batterySafetyEnabled.store(
-        Wh_GetIntSetting(L"Battery.enabled") != 0,
-        std::memory_order_release);
-    g_batterySafetyUsePercentage.store(
-        Wh_GetIntSetting(L"Battery.trigger") == 1,
-        std::memory_order_release);
-    g_batterySafetyDelayMinutes.store(
-        (std::clamp)(Wh_GetIntSetting(L"Battery.delayMinutes"),
-                     0,
-                     10080),
-        std::memory_order_release);
-    g_batterySafetyRemainingPercent.store(
-        (std::clamp)(
-            Wh_GetIntSetting(L"Battery.remainingPercent"), 0, 100),
-        std::memory_order_release);
-    int batteryAction = Wh_GetIntSetting(L"Battery.action");
-    g_batterySafetyAction.store(
-        batteryAction == static_cast<int>(kShutDownValue)
-            ? kShutDownValue
-            : kSleepValue,
-        std::memory_order_release);
+    InitializeSafetyStorage();
+    LoadSafetySettings();
 }
 
 bool RunFromWindowThread(HWND hWnd,
@@ -1662,11 +1724,293 @@ void CloseSafetyTimer() {
     CloseThreadpoolTimer(timer);
 }
 
+void ReloadSafetySettingsAfterFlyoutSave() {
+    g_safetySettingsGeneration.fetch_add(
+        1, std::memory_order_acq_rel);
+    {
+        std::lock_guard<std::mutex> lock(g_safetyMutex);
+        ResetSafetyStateLocked();
+    }
+    LoadSafetySettings();
+    g_safetySettingsGeneration.fetch_add(
+        1, std::memory_order_acq_rel);
+    RefreshSafetySchedule();
+}
+
+void AppendComboBoxItem(ComboBox const& comboBox,
+                        wchar_t const* label) {
+    comboBox.Items().Append(
+        winrt::box_value(winrt::hstring(label)));
+}
+
+void UpdateSafetyFlyoutThreshold() {
+    if (!g_safetyFlyout) {
+        return;
+    }
+
+    auto& state = *g_safetyFlyout;
+    bool battery = state.source.SelectedIndex() == 1;
+    bool usePercentage =
+        battery && state.trigger.SelectedIndex() == 1;
+    DWORD value = usePercentage
+                      ? g_batterySafetyRemainingPercent.load(
+                            std::memory_order_acquire)
+                      : battery
+                            ? g_batterySafetyDelayMinutes.load(
+                                  std::memory_order_acquire)
+                            : g_pluggedInSafetyDelayMinutes.load(
+                                  std::memory_order_acquire);
+
+    state.threshold.Header(winrt::box_value(winrt::hstring(
+        usePercentage ? L"Remaining battery (%)" : L"Delay (minutes)")));
+    state.threshold.Text(
+        winrt::hstring(std::to_wstring(value)));
+}
+
+void PopulateSafetyFlyoutForSource() {
+    if (!g_safetyFlyout) {
+        return;
+    }
+
+    auto& state = *g_safetyFlyout;
+    bool battery = state.source.SelectedIndex() == 1;
+    state.enabled.IsOn(
+        battery
+            ? g_batterySafetyEnabled.load(std::memory_order_acquire)
+            : g_pluggedInSafetyEnabled.load(
+                  std::memory_order_acquire));
+    state.trigger.Visibility(
+        battery ? Visibility::Visible : Visibility::Collapsed);
+    state.trigger.SelectedIndex(
+        battery && g_batterySafetyUsePercentage.load(
+                       std::memory_order_acquire)
+            ? 1
+            : 0);
+    DWORD action =
+        battery
+            ? g_batterySafetyAction.load(std::memory_order_acquire)
+            : g_pluggedInSafetyAction.load(
+                  std::memory_order_acquire);
+    state.action.SelectedIndex(action == kShutDownValue ? 1 : 0);
+    state.status.Visibility(Visibility::Collapsed);
+    UpdateSafetyFlyoutThreshold();
+}
+
+bool ParseSafetyThreshold(TextBox const& textBox,
+                          DWORD maximum,
+                          DWORD* value) {
+    std::wstring text = textBox.Text().c_str();
+    wchar_t* end = nullptr;
+    errno = 0;
+    long parsed = std::wcstol(text.c_str(), &end, 10);
+    while (end && *end && std::iswspace(*end)) {
+        end++;
+    }
+    if (errno == ERANGE || end == text.c_str() ||
+        (end && *end) || parsed < 1 ||
+        parsed > static_cast<long>(maximum)) {
+        return false;
+    }
+
+    *value = static_cast<DWORD>(parsed);
+    return true;
+}
+
+bool StoreSafetyFlyoutValues(PowerSource source,
+                             bool enabled,
+                             bool usePercentage,
+                             DWORD threshold,
+                             DWORD action) {
+    bool stored = true;
+    if (source == PowerSource::PluggedIn) {
+        stored = Wh_SetIntValue(kPluggedInEnabledName, enabled) && stored;
+        stored = Wh_SetIntValue(kPluggedInDelayName, threshold) && stored;
+        stored = Wh_SetIntValue(kPluggedInActionName, action) && stored;
+    } else {
+        stored = Wh_SetIntValue(kBatteryEnabledName, enabled) && stored;
+        stored = Wh_SetIntValue(kBatteryTriggerName, usePercentage) && stored;
+        if (usePercentage) {
+            stored = Wh_SetIntValue(kBatteryPercentName, threshold) && stored;
+        } else {
+            stored = Wh_SetIntValue(kBatteryDelayName, threshold) && stored;
+        }
+        stored = Wh_SetIntValue(kBatteryActionName, action) && stored;
+    }
+    return stored;
+}
+
+void SaveSafetyFlyout() {
+    if (!g_safetyFlyout) {
+        return;
+    }
+
+    auto& state = *g_safetyFlyout;
+    bool battery = state.source.SelectedIndex() == 1;
+    bool usePercentage =
+        battery && state.trigger.SelectedIndex() == 1;
+    DWORD threshold = 0;
+    DWORD maximum = usePercentage ? 100 : 10080;
+    if (!ParseSafetyThreshold(
+            state.threshold, maximum, &threshold)) {
+        state.status.Text(usePercentage
+                              ? L"Enter a percentage from 1 to 100."
+                              : L"Enter minutes from 1 to 10080.");
+        state.status.Visibility(Visibility::Visible);
+        return;
+    }
+
+    DWORD action = state.action.SelectedIndex() == 1
+                       ? kShutDownValue
+                       : kSleepValue;
+    PowerSource source = battery
+                             ? PowerSource::OnBattery
+                             : PowerSource::PluggedIn;
+    if (!StoreSafetyFlyoutValues(source,
+                                 state.enabled.IsOn(),
+                                 usePercentage,
+                                 threshold,
+                                 action)) {
+        state.status.Text(L"Couldn't save the safety rule.");
+        state.status.Visibility(Visibility::Visible);
+        return;
+    }
+
+    ReloadSafetySettingsAfterFlyoutSave();
+    state.flyout.Hide();
+}
+
+void CloseSafetyFlyout() {
+    if (!g_safetyFlyout) {
+        return;
+    }
+
+    Flyout flyout = g_safetyFlyout->flyout;
+    g_safetyFlyout.reset();
+    try {
+        flyout.Hide();
+    } catch (...) {
+    }
+}
+
+void ShowSafetyFlyout() {
+    if (g_unloading || !g_button || g_safetyFlyout) {
+        return;
+    }
+
+    try {
+        auto state = std::make_unique<SafetyFlyoutState>();
+        state->flyout = Flyout();
+        state->source = ComboBox();
+        state->enabled = ToggleSwitch();
+        state->trigger = ComboBox();
+        state->threshold = TextBox();
+        state->action = ComboBox();
+        state->status = TextBlock();
+        state->save = Button();
+
+        StackPanel panel;
+        panel.Width(260);
+
+        TextBlock title;
+        title.Text(L"Closed-lid safety");
+        title.FontSize(18);
+        title.Margin({0, 0, 0, 12});
+        panel.Children().Append(title);
+
+        state->source.Header(
+            winrt::box_value(winrt::hstring(L"Power source")));
+        AppendComboBoxItem(state->source, L"Plugged in");
+        AppendComboBoxItem(state->source, L"Battery");
+        state->source.HorizontalAlignment(HorizontalAlignment::Stretch);
+        state->source.Margin({0, 0, 0, 8});
+        panel.Children().Append(state->source);
+
+        state->enabled.Header(
+            winrt::box_value(winrt::hstring(L"Enabled")));
+        state->enabled.Margin({0, 0, 0, 8});
+        panel.Children().Append(state->enabled);
+
+        state->trigger.Header(
+            winrt::box_value(winrt::hstring(L"Trigger")));
+        AppendComboBoxItem(state->trigger, L"After a delay");
+        AppendComboBoxItem(state->trigger, L"At battery level");
+        state->trigger.HorizontalAlignment(HorizontalAlignment::Stretch);
+        state->trigger.Margin({0, 0, 0, 8});
+        panel.Children().Append(state->trigger);
+
+        state->threshold.MaxLength(5);
+        state->threshold.Margin({0, 0, 0, 8});
+        panel.Children().Append(state->threshold);
+
+        state->action.Header(
+            winrt::box_value(winrt::hstring(L"Safety action")));
+        AppendComboBoxItem(state->action, L"Sleep");
+        AppendComboBoxItem(state->action, L"Shut down");
+        state->action.HorizontalAlignment(HorizontalAlignment::Stretch);
+        state->action.Margin({0, 0, 0, 8});
+        panel.Children().Append(state->action);
+
+        state->status.TextWrapping(TextWrapping::Wrap);
+        state->status.Visibility(Visibility::Collapsed);
+        state->status.Margin({0, 0, 0, 8});
+        panel.Children().Append(state->status);
+
+        state->save.Content(
+            winrt::box_value(winrt::hstring(L"Save")));
+        state->save.HorizontalAlignment(HorizontalAlignment::Right);
+        panel.Children().Append(state->save);
+
+        state->flyout.Content(panel);
+        g_safetyFlyout = std::move(state);
+
+        g_safetyFlyout->source.SelectionChanged(
+            [](winrt::Windows::Foundation::IInspectable const&,
+               SelectionChangedEventArgs const&) {
+                PopulateSafetyFlyoutForSource();
+            });
+        g_safetyFlyout->trigger.SelectionChanged(
+            [](winrt::Windows::Foundation::IInspectable const&,
+               SelectionChangedEventArgs const&) {
+                UpdateSafetyFlyoutThreshold();
+            });
+        g_safetyFlyout->save.Click(
+            [](winrt::Windows::Foundation::IInspectable const&,
+               RoutedEventArgs const&) {
+                SaveSafetyFlyout();
+            });
+        g_safetyFlyout->flyout.Closed(
+            [](winrt::Windows::Foundation::IInspectable const& sender,
+               winrt::Windows::Foundation::IInspectable const&) {
+                if (g_safetyFlyout &&
+                    winrt::get_abi(sender) ==
+                        winrt::get_abi(g_safetyFlyout->flyout)) {
+                    g_safetyFlyout.reset();
+                }
+            });
+
+        DWORD sourceError = ERROR_SUCCESS;
+        PowerSource source = GetCurrentPowerSource(&sourceError);
+        g_safetyFlyout->source.SelectedIndex(
+            source == PowerSource::OnBattery ? 1 : 0);
+        PopulateSafetyFlyoutForSource();
+        g_safetyFlyout->flyout.ShowAt(g_button);
+    } catch (winrt::hresult_error const& error) {
+        g_safetyFlyout.reset();
+        Wh_Log(L"Failed to show the safety flyout: 0x%08X (%ls)",
+               static_cast<unsigned>(error.code().value),
+               error.message().c_str());
+    }
+}
+
 void ReleaseButtonReferences() {
+    CloseSafetyFlyout();
     if (g_button) {
         try {
             if (g_tappedToken.value) {
                 g_button.Tapped(g_tappedToken);
+            }
+            if (g_rightTappedToken.value) {
+                g_button.RightTapped(g_rightTappedToken);
             }
             if (g_pointerEnteredToken.value) {
                 g_button.PointerEntered(g_pointerEnteredToken);
@@ -1696,6 +2040,7 @@ void ReleaseButtonReferences() {
     }
 
     g_tappedToken = {};
+    g_rightTappedToken = {};
     g_pointerEnteredToken = {};
     g_pointerExitedToken = {};
     g_pointerPressedToken = {};
@@ -1814,6 +2159,14 @@ Grid BuildButtonRoot() {
            wuxi::TappedRoutedEventArgs const&) {
             if (!g_unloading) {
                 OnButtonClick();
+            }
+        });
+    g_rightTappedToken = root.RightTapped(
+        [](winrt::Windows::Foundation::IInspectable const&,
+           wuxi::RightTappedRoutedEventArgs const& args) {
+            if (!g_unloading) {
+                args.Handled(true);
+                ShowSafetyFlyout();
             }
         });
     g_pointerEnteredToken = root.PointerEntered(
