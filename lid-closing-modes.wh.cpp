@@ -2,7 +2,7 @@
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
 // @description     Adds a taskbar button that cycles through selected lid-close actions
-// @version         1.9.0
+// @version         1.9.1
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
@@ -45,8 +45,9 @@ battery rules are configured independently. The battery rule can use either a
 time delay or a remaining-charge threshold. These rules use Windows power
 notifications and a one-shot timer; they don't poll.
 
-Right-click the taskbar button to configure the safety rules. The flyout is
-created on demand and released as soon as it closes.
+Right-click the taskbar button to configure the safety rules. The Windows
+11-styled acrylic flyout is created on demand, and all of its controls and
+brushes are released as soon as it closes.
 
 This mod targets the Windows 11 XAML taskbar.
 */
@@ -81,12 +82,14 @@ This mod targets the Windows 11 XAML taskbar.
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.UI.Text.h>
 #include <winrt/Windows.UI.Input.h>
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Automation.h>
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Input.h>
+#include <winrt/Windows.UI.Xaml.Interop.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 
 #include <algorithm>
@@ -232,6 +235,7 @@ struct PowerSchemeLidValues {
 };
 
 struct SafetyFlyoutState {
+    ULONGLONG instanceId = 0;
     Flyout flyout{nullptr};
     ComboBox source{nullptr};
     ToggleSwitch enabled{nullptr};
@@ -265,6 +269,7 @@ HPOWERNOTIFY g_batteryPercentageNotification = nullptr;
 std::atomic<unsigned> g_activePowerCallbacks{0};
 std::atomic<bool> g_systemTrayModuleHooked{false};
 std::unique_ptr<SafetyFlyoutState> g_safetyFlyout;
+ULONGLONG g_nextSafetyFlyoutInstanceId = 0;
 
 PTP_TIMER g_safetyTimer = nullptr;
 std::mutex g_safetyMutex;
@@ -1743,6 +1748,94 @@ void AppendComboBoxItem(ComboBox const& comboBox,
         winrt::box_value(winrt::hstring(label)));
 }
 
+SolidColorBrush CreateSolidColorBrush(
+    winrt::Windows::UI::Color color) {
+    SolidColorBrush brush;
+    brush.Color(color);
+    return brush;
+}
+
+Brush CreateSafetyFlyoutBackground(bool light,
+                                   bool highContrast) {
+    if (highContrast) {
+        return CreateSolidColorBrush(SystemColor(COLOR_WINDOW));
+    }
+
+    AcrylicBrush brush;
+    brush.BackgroundSource(AcrylicBackgroundSource::HostBackdrop);
+    if (light) {
+        brush.TintColor({0xFF, 0xFC, 0xFC, 0xFC});
+        brush.TintOpacity(0.0);
+        brush.TintLuminosityOpacity(
+            winrt::box_value(0.85).as<
+                winrt::Windows::Foundation::IReference<double>>());
+        brush.FallbackColor({0xFF, 0xF9, 0xF9, 0xF9});
+    } else {
+        brush.TintColor({0xFF, 0x2C, 0x2C, 0x2C});
+        brush.TintOpacity(0.15);
+        brush.TintLuminosityOpacity(
+            winrt::box_value(0.96).as<
+                winrt::Windows::Foundation::IReference<double>>());
+        brush.FallbackColor({0xFF, 0x2C, 0x2C, 0x2C});
+    }
+    return brush;
+}
+
+Style CreateSafetyFlyoutPresenterStyle(bool light,
+                                       bool highContrast) {
+    Style style{winrt::xaml_typename<FlyoutPresenter>()};
+    Brush background =
+        CreateSafetyFlyoutBackground(light, highContrast);
+    Brush foreground = CreateSolidColorBrush(
+        highContrast ? SystemColor(COLOR_WINDOWTEXT)
+                     : light
+                           ? winrt::Windows::UI::Color{
+                                 0xE4, 0x00, 0x00, 0x00}
+                           : winrt::Windows::UI::Color{
+                                 0xFF, 0xFF, 0xFF, 0xFF});
+    Brush border = CreateSolidColorBrush(
+        highContrast ? SystemColor(COLOR_WINDOWTEXT)
+                     : light
+                           ? winrt::Windows::UI::Color{
+                                 0x0F, 0x00, 0x00, 0x00}
+                           : winrt::Windows::UI::Color{
+                                 0x33, 0x00, 0x00, 0x00});
+
+    style.Setters().Append(
+        Setter(Control::BackgroundProperty(), background));
+    style.Setters().Append(
+        Setter(Control::ForegroundProperty(), foreground));
+    style.Setters().Append(
+        Setter(Control::BorderBrushProperty(), border));
+    style.Setters().Append(Setter(
+        Control::BorderThicknessProperty(),
+        winrt::box_value(Thickness{
+            highContrast ? 2.0 : 1.0,
+            highContrast ? 2.0 : 1.0,
+            highContrast ? 2.0 : 1.0,
+            highContrast ? 2.0 : 1.0})));
+    style.Setters().Append(Setter(
+        Control::CornerRadiusProperty(),
+        winrt::box_value(CornerRadius{8, 8, 8, 8})));
+    style.Setters().Append(Setter(
+        Control::PaddingProperty(),
+        winrt::box_value(Thickness{16, 15, 16, 17})));
+    style.Setters().Append(Setter(
+        Control::FontFamilyProperty(),
+        FontFamily(L"Segoe UI Variable Text")));
+    style.Setters().Append(Setter(
+        Control::FontSizeProperty(), winrt::box_value(14.0)));
+    return style;
+}
+
+template <typename T>
+void ApplySafetyFlyoutControlGeometry(T const& control) {
+    control.MinHeight(32);
+    control.FontFamily(FontFamily(L"Segoe UI Variable Text"));
+    control.FontSize(14);
+    control.CornerRadius({4, 4, 4, 4});
+}
+
 void UpdateSafetyFlyoutThreshold() {
     if (!g_safetyFlyout) {
         return;
@@ -1893,12 +1986,15 @@ void CloseSafetyFlyout() {
 }
 
 void ShowSafetyFlyout() {
-    if (g_unloading || !g_button || g_safetyFlyout) {
+    if (g_unloading || !g_button) {
         return;
     }
 
+    CloseSafetyFlyout();
+
     try {
         auto state = std::make_unique<SafetyFlyoutState>();
+        state->instanceId = ++g_nextSafetyFlyoutInstanceId;
         state->flyout = Flyout();
         state->source = ComboBox();
         state->enabled = ToggleSwitch();
@@ -1908,53 +2004,89 @@ void ShowSafetyFlyout() {
         state->status = TextBlock();
         state->save = Button();
 
+        bool light = IsButtonThemeLight();
+        bool highContrast = IsHighContrastEnabled();
+        state->flyout.FlyoutPresenterStyle(
+            CreateSafetyFlyoutPresenterStyle(light, highContrast));
+        state->flyout.Placement(
+            winrt::Windows::UI::Xaml::Controls::Primitives::
+                FlyoutPlacementMode::TopEdgeAlignedRight);
+
         StackPanel panel;
-        panel.Width(260);
+        panel.Width(288);
+        panel.RequestedTheme(
+            highContrast ? ElementTheme::Default
+                         : light ? ElementTheme::Light
+                                 : ElementTheme::Dark);
 
         TextBlock title;
         title.Text(L"Closed-lid safety");
-        title.FontSize(18);
-        title.Margin({0, 0, 0, 12});
+        title.FontFamily(FontFamily(L"Segoe UI Variable Display"));
+        title.FontSize(14);
+        title.FontWeight(
+            winrt::Windows::UI::Text::FontWeights::SemiBold());
+        title.Margin({0, 0, 0, 16});
         panel.Children().Append(title);
 
         state->source.Header(
             winrt::box_value(winrt::hstring(L"Power source")));
         AppendComboBoxItem(state->source, L"Plugged in");
         AppendComboBoxItem(state->source, L"Battery");
+        ApplySafetyFlyoutControlGeometry(state->source);
         state->source.HorizontalAlignment(HorizontalAlignment::Stretch);
-        state->source.Margin({0, 0, 0, 8});
+        state->source.Margin({0, 0, 0, 12});
         panel.Children().Append(state->source);
 
         state->enabled.Header(
             winrt::box_value(winrt::hstring(L"Enabled")));
-        state->enabled.Margin({0, 0, 0, 8});
+        state->enabled.FontFamily(
+            FontFamily(L"Segoe UI Variable Text"));
+        state->enabled.FontSize(14);
+        state->enabled.Margin({0, 0, 0, 12});
         panel.Children().Append(state->enabled);
 
         state->trigger.Header(
             winrt::box_value(winrt::hstring(L"Trigger")));
         AppendComboBoxItem(state->trigger, L"After a delay");
         AppendComboBoxItem(state->trigger, L"At battery level");
+        ApplySafetyFlyoutControlGeometry(state->trigger);
         state->trigger.HorizontalAlignment(HorizontalAlignment::Stretch);
-        state->trigger.Margin({0, 0, 0, 8});
+        state->trigger.Margin({0, 0, 0, 12});
         panel.Children().Append(state->trigger);
 
+        ApplySafetyFlyoutControlGeometry(state->threshold);
         state->threshold.MaxLength(5);
-        state->threshold.Margin({0, 0, 0, 8});
+        state->threshold.Margin({0, 0, 0, 12});
         panel.Children().Append(state->threshold);
 
         state->action.Header(
             winrt::box_value(winrt::hstring(L"Safety action")));
         AppendComboBoxItem(state->action, L"Sleep");
         AppendComboBoxItem(state->action, L"Shut down");
+        ApplySafetyFlyoutControlGeometry(state->action);
         state->action.HorizontalAlignment(HorizontalAlignment::Stretch);
-        state->action.Margin({0, 0, 0, 8});
+        state->action.Margin({0, 0, 0, 16});
         panel.Children().Append(state->action);
 
+        state->status.FontFamily(
+            FontFamily(L"Segoe UI Variable Text"));
+        state->status.FontSize(12);
+        state->status.Foreground(CreateSolidColorBrush(
+            highContrast ? SystemColor(COLOR_WINDOWTEXT)
+                         : light
+                               ? winrt::Windows::UI::Color{
+                                     0xFF, 0xC4, 0x2B, 0x1C}
+                               : winrt::Windows::UI::Color{
+                                     0xFF, 0xFF, 0x99, 0xA4}));
         state->status.TextWrapping(TextWrapping::Wrap);
         state->status.Visibility(Visibility::Collapsed);
         state->status.Margin({0, 0, 0, 8});
         panel.Children().Append(state->status);
 
+        ApplySafetyFlyoutControlGeometry(state->save);
+        state->save.FontWeight(
+            winrt::Windows::UI::Text::FontWeights::SemiBold());
+        state->save.Padding({16, 4, 16, 5});
         state->save.Content(
             winrt::box_value(winrt::hstring(L"Save")));
         state->save.HorizontalAlignment(HorizontalAlignment::Right);
@@ -1978,12 +2110,12 @@ void ShowSafetyFlyout() {
                RoutedEventArgs const&) {
                 SaveSafetyFlyout();
             });
+        ULONGLONG instanceId = g_safetyFlyout->instanceId;
         g_safetyFlyout->flyout.Closed(
-            [](winrt::Windows::Foundation::IInspectable const& sender,
+            [instanceId](winrt::Windows::Foundation::IInspectable const&,
                winrt::Windows::Foundation::IInspectable const&) {
                 if (g_safetyFlyout &&
-                    winrt::get_abi(sender) ==
-                        winrt::get_abi(g_safetyFlyout->flyout)) {
+                    g_safetyFlyout->instanceId == instanceId) {
                     g_safetyFlyout.reset();
                 }
             });

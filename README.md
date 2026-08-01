@@ -65,8 +65,9 @@ source's rule.
 
 Safety rules are disabled by default.
 
-The configuration flyout is created only when it is opened. Its XAML controls
-are released when it closes; only the rule values used by the scheduler remain.
+The Windows 11-styled configuration flyout is created only when it is opened.
+Its XAML controls and acrylic brush are released when it closes; only the rule
+values used by the scheduler remain.
 
 ## Install
 
