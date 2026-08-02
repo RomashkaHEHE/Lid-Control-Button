@@ -2,7 +2,7 @@
 // @id              lid-closing-modes
 // @name            Lid Closing Mode Button
 // @description     Adds a taskbar button that cycles through selected lid-close actions
-// @version         1.9.3
+// @version         1.9.4
 // @author          Roma
 // @include         explorer.exe
 // @architecture    x86-64
@@ -2013,6 +2013,10 @@ void ShowSafetyFlyout() {
         state->flyout.Placement(
             winrt::Windows::UI::Xaml::Controls::Primitives::
                 FlyoutPlacementMode::TopEdgeAlignedRight);
+        state->flyout.ShowMode(
+            winrt::Windows::UI::Xaml::Controls::Primitives::
+                FlyoutShowMode::Standard);
+        state->flyout.AllowFocusOnInteraction(true);
         state->flyout.ShouldConstrainToRootBounds(false);
 
         StackPanel panel;
@@ -2114,6 +2118,23 @@ void ShowSafetyFlyout() {
                 SaveSafetyFlyout();
             });
         ULONGLONG instanceId = g_safetyFlyout->instanceId;
+        g_safetyFlyout->flyout.Closing(
+            [instanceId](
+                winrt::Windows::UI::Xaml::Controls::Primitives::FlyoutBase const&,
+                winrt::Windows::UI::Xaml::Controls::Primitives::
+                    FlyoutBaseClosingEventArgs const& args) {
+                if (!g_safetyFlyout ||
+                    g_safetyFlyout->instanceId != instanceId) {
+                    return;
+                }
+
+                auto& state = *g_safetyFlyout;
+                if (state.source.IsDropDownOpen() ||
+                    state.trigger.IsDropDownOpen() ||
+                    state.action.IsDropDownOpen()) {
+                    args.Cancel(true);
+                }
+            });
         g_safetyFlyout->flyout.Closed(
             [instanceId](winrt::Windows::Foundation::IInspectable const&,
                winrt::Windows::Foundation::IInspectable const&) {
